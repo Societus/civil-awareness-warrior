@@ -109,10 +109,41 @@ Every execution failure maps to the coordinator's `failure_type` taxonomy
 `aborted_by_user`) and is POSTed to `/v1/fail` so the reaper can requeue or
 quarantine appropriately.
 
+## Library embedding (GUI prerequisite)
+
+Everything the CLI does is library API. A host application embeds the
+protocol instead of shelling out:
+
+```rust
+use lh_contributor_client::{RunOptions, Runner};
+use lh_contributor_client::config::Config;
+
+let cfg = Config::from_env()?;
+let (stop_tx, stop_rx) = tokio::sync::watch::channel(false); // GUI stop button
+let runner = Runner::new(cfg, RunOptions {
+    shutdown_rx: Some(stop_rx),
+    ..RunOptions::default()        // once / concurrency / capabilities / dry_run
+})?;
+
+let stats = runner.stats();        // clone + poll from the UI thread
+let snap = stats.snapshot();       // chunks completed/failed/verified,
+                                   // bytes staged, per-slot lease state, uptime
+runner.run().await?;               // drives slots to completion
+```
+
+API map: `api::ApiClient` (register / lease / heartbeat / result / fail /
+contract fetch), `runner::{Runner, RunOptions}` (the run loop),
+`stats::{StatsHandle, StatsSnapshot, SlotActivity}` (progress polling),
+`chunk::{execute, ExecContext}` + `chunk::{ingest, alt_source, state_walk,
+search, examination}` (per-type executors), `crypto::verify_lease_contract`
+(ed25519 + freshness), `config::{Config, save_credentials}`,
+`staging::{BlobStager, build_stager}`. `examples/embed.rs` is a runnable
+walkthrough (`cargo build --examples`).
+
 ## Development
 
 ```sh
-cargo test            # 39 tests: unit + protocol (wiremock) + executors
+cargo test            # 49 tests: unit + protocol (wiremock) + executors + runner/stats
 cargo clippy --all-targets
 ```
 
@@ -134,7 +165,10 @@ src/config.rs    LH_* env + credentials persistence
 src/rate.rs      rolling-window politeness limiter
 src/staging.rs   BlobStager: R2 direct (SigV4) / presign template / local
 src/chunk/       per-type executors + dispatch
-src/main.rs      CLI: register / run (slot loop, heartbeat, submit/fail)
+src/runner.rs    run loop (Runner): lease poll → verify → execute → submit
+src/stats.rs     StatsHandle: pollable progress for GUI embedders
+src/main.rs      thin CLI: register / run (maps flags onto RunOptions)
+examples/embed.rs  GUI-style embed walkthrough
 Dockerfile       rust:alpine → scratch, single static binary
 ```
 
