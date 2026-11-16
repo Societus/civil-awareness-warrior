@@ -1,0 +1,6 @@
+target/
+.git/
+lh-work/
+lh-staging/
+tests/
+*.md
