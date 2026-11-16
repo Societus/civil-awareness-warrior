@@ -1,0 +1,769 @@
+//! GUI ↔ protocol wiring: settings, run-loop lifecycle, status snapshots.
+//!
+//! Lifecycle model (the lib has no "pause" primitive — RunOptions only has
+//! the shutdown watch channel, so pause == graceful stop):
+//!
+//! - `start_contributor` builds a `Config` from settings + env and spawns
+//!   `Runner::run` on Tauri's tokio runtime, holding the `watch::Sender`
+//!   in `ActiveRun`.
+//! - `pause_contributor` fires that watch channel. The runner bridges it to
+//!   its internal shutdown signal: slots stop leasing, in-flight chunks
+//!   settle politely, heartbeats stop, and `run()` returns.
+//! - `resume` (or the primary button after pause/error) constructs a fresh
+//!   `Runner`; the client identity persists in `credentials.json`, so a
+//!   resume reuses the registered warrior instead of re-registering.
+//!
+//! Lease targets: `StatsHandle` exposes `{chunk_type, chunk_id}` per slot
+//! but not the contract's `target_key` (the lib cannot be modified from
+//! here), so a 2 s enrichment task resolves chunk_id → target_key through
+//! the public `GET /v1/chunk/:id/contract` endpoint and caches it. When a
+//! lookup fails the UI degrades to the chunk id.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use lh_contributor_client::api::{ALL_CHUNK_TYPES, ApiClient, Credentials};
+use lh_contributor_client::config::{save_credentials, Config, StagingConfig};
+use lh_contributor_client::stats::SlotActivity;
+use lh_contributor_client::{register_request, RunOptions, Runner, StatsHandle};
+use serde::{Deserialize, Serialize};
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tokio::sync::watch;
+use tauri::{AppHandle, Manager};
+
+use crate::settings::{self, GuiSettings};
+
+pub const TRAY_ID: &str = "lh-contributor-tray";
+
+const HEALTH_POLL_SECS: u64 = 20;
+const ENRICH_POLL_SECS: u64 = 2;
+/// Contract lookups attempted per chunk_id before giving up (UI falls back
+/// to the chunk id itself).
+const LEASE_LOOKUP_MAX_ATTEMPTS: u8 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    Idle,
+    Starting,
+    Running,
+    Stopping,
+    Paused,
+    Error,
+}
+
+impl Phase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Phase::Idle => "idle",
+            Phase::Starting => "starting",
+            Phase::Running => "running",
+            Phase::Stopping => "stopping",
+            Phase::Paused => "paused",
+            Phase::Error => "error",
+        }
+    }
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn guard<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A spawned `Runner::run` task plus its control channel. `finished` flips
+/// when the future resolves; stats stay readable for the UI afterwards.
+struct ActiveRun {
+    stats: StatsHandle,
+    stop_tx: watch::Sender<bool>,
+    stop_requested: bool,
+    finished: bool,
+}
+
+pub struct AppState {
+    data_dir: PathBuf,
+    settings: Mutex<GuiSettings>,
+    phase: Mutex<Phase>,
+    last_error: Mutex<Option<String>>,
+    /// 0 = never checked, 1 = healthy, 2 = unreachable.
+    coordinator_ok: AtomicU8,
+    last_health_ok_ms: AtomicI64,
+    active: Mutex<Option<ActiveRun>>,
+    /// chunk_id → target_key, filled by the enrichment task.
+    lease_targets: Mutex<HashMap<String, String>>,
+    lease_attempts: Mutex<HashMap<String, u8>>,
+}
+
+impl AppState {
+    pub fn new(data_dir: PathBuf, settings: GuiSettings) -> AppState {
+        AppState {
+            data_dir,
+            settings: Mutex::new(settings),
+            phase: Mutex::new(Phase::Idle),
+            last_error: Mutex::new(None),
+            coordinator_ok: AtomicU8::new(0),
+            last_health_ok_ms: AtomicI64::new(0),
+            active: Mutex::new(None),
+            lease_targets: Mutex::new(HashMap::new()),
+            lease_attempts: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn phase(&self) -> Phase {
+        *guard(&self.phase)
+    }
+
+    fn set_phase(&self, p: Phase) {
+        *guard(&self.phase) = p;
+    }
+
+    fn settings_snapshot(&self) -> GuiSettings {
+        guard(&self.settings).clone()
+    }
+
+    fn creds_path(&self) -> PathBuf {
+        self.data_dir.join("credentials.json")
+    }
+
+    fn credentials(&self) -> Option<Credentials> {
+        std::fs::read_to_string(self.creds_path())
+            .ok()
+            .and_then(|t| serde_json::from_str::<Credentials>(&t).ok())
+    }
+
+    fn api_client(&self) -> Result<ApiClient, String> {
+        let url = self.settings_snapshot().coordinator_url;
+        ApiClient::new(&url, Duration::from_secs(10)).map_err(|e| format!("bad coordinator URL: {e}"))
+    }
+
+    /// Resolve LH_* staging env the same way the lib's `Config::from_env`
+    /// does; real (non-dry) runs without R2/presign env are refused by
+    /// `Runner::new` with its own explanatory error.
+    fn staging_from_env(data_dir: &Path) -> StagingConfig {
+        if let Ok(t) = std::env::var("LH_UPLOAD_PRESIGN_TEMPLATE") {
+            if !t.trim().is_empty() && t.contains("{key}") {
+                return StagingConfig::PresignTemplate {
+                    url_template: t.trim().to_string(),
+                };
+            }
+        }
+        let bucket = std::env::var("LH_R2_BUCKET").ok().filter(|v| !v.trim().is_empty());
+        let ak = std::env::var("LH_R2_ACCESS_KEY_ID")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        let sk = std::env::var("LH_R2_SECRET_ACCESS_KEY")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        if let (Some(bucket), Some(ak), Some(sk)) = (bucket, ak, sk) {
+            let endpoint = std::env::var("LH_R2_ENDPOINT")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .or_else(|| {
+                    std::env::var("LH_R2_ACCOUNT_ID")
+                        .ok()
+                        .filter(|v| !v.trim().is_empty())
+                        .map(|a| format!("https://{}.r2.cloudflarestorage.com", a.trim()))
+                });
+            if let Some(endpoint) = endpoint {
+                return StagingConfig::R2 {
+                    endpoint,
+                    bucket,
+                    access_key_id: ak,
+                    secret_access_key: sk,
+                };
+            }
+        }
+        StagingConfig::Local {
+            root: data_dir.join("staging"),
+        }
+    }
+
+    fn staging_mode(settings: &GuiSettings) -> &'static str {
+        if settings.dry_run {
+            return "staging: local (dry run)";
+        }
+        if std::env::var("LH_UPLOAD_PRESIGN_TEMPLATE")
+            .ok()
+            .is_some_and(|t| !t.trim().is_empty() && t.contains("{key}")
+                || (!t.trim().is_empty() && !t.contains("{key}")))
+        {
+            // A malformed template is a config error; say presign so the
+            // user sees where the runner will choke.
+            return "staging: presigned upload URLs";
+        }
+        let r2_ok = std::env::var("LH_R2_BUCKET").is_ok()
+            && std::env::var("LH_R2_ACCESS_KEY_ID").is_ok()
+            && std::env::var("LH_R2_SECRET_ACCESS_KEY").is_ok()
+            && (std::env::var("LH_R2_ENDPOINT").is_ok() || std::env::var("LH_R2_ACCOUNT_ID").is_ok());
+        if r2_ok {
+            "staging: Cloudflare R2"
+        } else {
+            "staging: not configured (real runs will refuse to start)"
+        }
+    }
+
+    fn build_config(&self) -> Result<(Config, bool), String> {
+        let s = self.settings_snapshot();
+        let key = s.resolved_public_key();
+        if key.len() != 64 || !key.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(
+                "contract public key missing — set LH_PUBLIC_KEY_HEX (64-char hex ed25519) \
+                 or enter it under Settings"
+                    .to_string(),
+            );
+        }
+        let cfg = Config {
+            coordinator_url: s.coordinator_url.clone(),
+            public_key_hex: key,
+            credentials: self.credentials(),
+            concurrency: s.concurrency,
+            work_dir: self.data_dir.clone(),
+            rate_limit: None,
+            staging: Self::staging_from_env(&self.data_dir),
+            brave_api_key: std::env::var("LH_BRAVE_API_KEY")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            http_timeout_secs: 60,
+        };
+        Ok((cfg, s.dry_run))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Run-loop lifecycle
+// ---------------------------------------------------------------------------
+
+pub fn start(app: &AppHandle) -> Result<(), String> {
+    let st = app.state::<AppState>();
+    {
+        let active = guard(&st.active);
+        if active.as_ref().is_some_and(|r| !r.finished) {
+            return Err("contributor loop already running".to_string());
+        }
+    }
+    if st.phase() == Phase::Starting {
+        return Err("startup already in progress".to_string());
+    }
+
+    *guard(&st.last_error) = None;
+    st.set_phase(Phase::Starting);
+    *guard(&st.active) = None; // drop the previous session's stats view
+    guard(&st.lease_targets).clear();
+    guard(&st.lease_attempts).clear();
+
+    let fail = |msg: String| {
+        *guard(&st.last_error) = Some(msg.clone());
+        st.set_phase(Phase::Error);
+        set_pause_label(app, false);
+        msg
+    };
+
+    let (cfg, dry_run) = match st.build_config() {
+        Ok(v) => v,
+        Err(e) => return Err(fail(e)),
+    };
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let runner = match Runner::new(cfg, RunOptions {
+        once: false,
+        concurrency: None, // settings.concurrency is already inside Config
+        capabilities: ALL_CHUNK_TYPES.to_vec(),
+        dry_run,
+        shutdown_rx: Some(stop_rx),
+    }) {
+        Ok(r) => r,
+        Err(e) => return Err(fail(format!("{e:#}"))),
+    };
+
+    let stats = runner.stats();
+    *guard(&st.active) = Some(ActiveRun {
+        stats,
+        stop_tx,
+        stop_requested: false,
+        finished: false,
+    });
+    st.set_phase(Phase::Running);
+    set_pause_label(app, true);
+
+    let app2 = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let result = runner.run().await;
+        let st = app2.state::<AppState>();
+        let was_user_stop = guard(&st.active)
+            .as_ref()
+            .map(|r| r.stop_requested)
+            .unwrap_or(false);
+        if let Some(run) = guard(&st.active).as_mut() {
+            run.finished = true;
+        }
+        match result {
+            Ok(()) => st.set_phase(if was_user_stop { Phase::Paused } else { Phase::Idle }),
+            Err(e) => {
+                *guard(&st.last_error) = Some(format!("{e:#}"));
+                st.set_phase(Phase::Error);
+            }
+        }
+        set_pause_label(&app2, false);
+    });
+    Ok(())
+}
+
+pub fn pause(app: &AppHandle) -> Result<(), String> {
+    let st = app.state::<AppState>();
+    match st.phase() {
+        Phase::Running => {
+            if let Some(run) = guard(&st.active).as_mut() {
+                run.stop_requested = true;
+                let _ = run.stop_tx.send(true);
+            }
+            st.set_phase(Phase::Stopping);
+            set_pause_label(app, false);
+            Ok(())
+        }
+        Phase::Stopping => Err("already stopping — waiting for in-flight leases to settle".to_string()),
+        _ => Err("contributor loop is not running".to_string()),
+    }
+}
+
+pub fn toggle_pause(app: &AppHandle) {
+    match app.state::<AppState>().phase() {
+        Phase::Running => {
+            let _ = pause(app);
+        }
+        Phase::Starting | Phase::Stopping => {}
+        _ => {
+            let _ = start(app);
+        }
+    }
+}
+
+pub fn graceful_shutdown_and_exit(app: &AppHandle) {
+    let st = app.state::<AppState>();
+    if let Some(run) = guard(&st.active).as_mut() {
+        run.stop_requested = true;
+        let _ = run.stop_tx.send(true);
+    }
+    st.set_phase(Phase::Stopping);
+    // Grace window for the runner to finish in-flight reports before exit.
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(2500));
+        handle.exit(0);
+    });
+}
+
+pub fn set_pause_label(app: &AppHandle, running: bool) {
+    // TrayIcon has no menu getter in this tauri version (only set_menu), so
+    // the label flip rebuilds the three-item menu. Event handlers live on
+    // the TrayIcon itself and keep dispatching for the replaced menu.
+    let Some(tray) = app.tray_by_id(TRAY_ID) else {
+        return;
+    };
+    let pause_label = if running { "Pause" } else { "Resume" };
+    let built = (|| -> tauri::Result<()> {
+        let show = MenuItem::with_id(app, "show", "Show", true, None::<&str>)?;
+        let pause = MenuItem::with_id(app, "pause", pause_label, true, None::<&str>)?;
+        let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+        let sep = PredefinedMenuItem::separator(app)?;
+        let menu = Menu::with_items(app, &[&show, &pause, &sep, &quit])?;
+        tray.set_menu(Some(menu))
+    })();
+    let _ = built;
+}
+
+// ---------------------------------------------------------------------------
+// Background tasks (coordinator health + lease target enrichment)
+// ---------------------------------------------------------------------------
+
+pub fn start_background_tasks(app: &AppHandle) {
+    let h = app.clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(HEALTH_POLL_SECS)).await;
+            poll_health(&h).await;
+        }
+    });
+    let h = app.clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(ENRICH_POLL_SECS)).await;
+            enrich_leases(&h).await;
+        }
+    });
+}
+
+pub async fn poll_health(app: &AppHandle) {
+    let st = app.state::<AppState>();
+    let api = match st.api_client() {
+        Ok(a) => a,
+        Err(_) => {
+            st.coordinator_ok.store(2, Ordering::Relaxed);
+            return;
+        }
+    };
+    match api.health().await {
+        Ok(_) => {
+            st.coordinator_ok.store(1, Ordering::Relaxed);
+            st.last_health_ok_ms.store(now_ms(), Ordering::Relaxed);
+        }
+        Err(_) => st.coordinator_ok.store(2, Ordering::Relaxed),
+    }
+}
+
+async fn enrich_leases(app: &AppHandle) {
+    let st = app.state::<AppState>();
+    let snap = {
+        let active = guard(&st.active);
+        match active.as_ref() {
+            Some(run) if !run.finished => run.stats.snapshot(),
+            _ => return,
+        }
+    };
+
+    let mut wanted: Vec<String> = Vec::new();
+    for act in &snap.slots {
+        let id = match act {
+            SlotActivity::Verifying { chunk_id, .. }
+            | SlotActivity::Executing { chunk_id, .. }
+            | SlotActivity::Submitting { chunk_id } => chunk_id.clone(),
+            _ => continue,
+        };
+        if guard(&st.lease_targets).contains_key(&id) {
+            continue;
+        }
+        if guard(&st.lease_attempts).get(&id).copied().unwrap_or(0) >= LEASE_LOOKUP_MAX_ATTEMPTS {
+            continue;
+        }
+        if !wanted.contains(&id) {
+            wanted.push(id);
+        }
+    }
+    if wanted.is_empty() {
+        return;
+    }
+
+    let api = match st.api_client() {
+        Ok(a) => a,
+        Err(_) => return,
+    };
+    for id in wanted {
+        match api.fetch_contract(&id).await {
+            Ok(contract) => {
+                guard(&st.lease_targets)
+                    .insert(id.clone(), contract.core.target_key);
+            }
+            Err(_) => {
+                *guard(&st.lease_attempts).entry(id).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // Keep the cache from growing without bound across a long run.
+    if guard(&st.lease_targets).len() > 400 {
+        let live: Vec<String> = snap
+            .slots
+            .iter()
+            .filter_map(|a| match a {
+                SlotActivity::Verifying { chunk_id, .. }
+                | SlotActivity::Executing { chunk_id, .. }
+                | SlotActivity::Submitting { chunk_id } => Some(chunk_id.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut targets = guard(&st.lease_targets);
+        targets.retain(|k, _| live.iter().any(|id| id == k));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Serialized views for the frontend
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+pub struct StatsOut {
+    pub chunks_completed: u64,
+    pub chunks_failed: u64,
+    pub chunks_verified: u64,
+    pub bytes_staged: u64,
+    pub uptime_secs: u64,
+}
+
+#[derive(Serialize)]
+pub struct SlotOut {
+    pub slot: u32,
+    pub activity: &'static str,
+    pub chunk_id: Option<String>,
+    pub chunk_type: Option<String>,
+    pub target_key: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct UiStatus {
+    pub phase: &'static str,
+    pub error: Option<String>,
+    pub coordinator_ok: Option<bool>,
+    pub last_health_ok_ms: Option<i64>,
+    pub dry_run: bool,
+    pub concurrency: u32,
+    pub staging: &'static str,
+    pub credentials_present: bool,
+    pub client_id: Option<String>,
+    pub stats: Option<StatsOut>,
+    pub slots: Vec<SlotOut>,
+    pub client_version: &'static str,
+    pub gui_version: &'static str,
+}
+
+#[derive(Serialize)]
+pub struct SettingsView {
+    pub coordinator_url: String,
+    pub concurrency: u32,
+    pub dry_run: bool,
+    pub staging_mode: &'static str,
+    pub public_key_configured: bool,
+    /// Last 6 hex chars of the configured PUBLIC key (not a secret, but we
+    /// still avoid echoing the whole thing into the webview).
+    pub public_key_tail: String,
+    pub data_dir: String,
+    pub credentials_path: String,
+    pub credentials_present: bool,
+    pub client_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct SettingsInput {
+    pub coordinator_url: Option<String>,
+    pub public_key_hex: Option<String>,
+    pub concurrency: Option<u32>,
+    pub dry_run: Option<bool>,
+}
+
+fn slot_out(i: usize, act: &SlotActivity, targets: &HashMap<String, String>) -> SlotOut {
+    let (activity, chunk_id, chunk_type) = match act {
+        SlotActivity::Polling => ("polling", None, None),
+        SlotActivity::Verifying { chunk_id, chunk_type } => (
+            "verifying",
+            Some(chunk_id.clone()),
+            Some(chunk_type.as_str().to_string()),
+        ),
+        SlotActivity::Executing { chunk_id, chunk_type } => (
+            "executing",
+            Some(chunk_id.clone()),
+            Some(chunk_type.as_str().to_string()),
+        ),
+        SlotActivity::Submitting { chunk_id } => ("submitting", Some(chunk_id.clone()), None),
+        SlotActivity::Stopped => ("stopped", None, None),
+    };
+    let target_key = chunk_id.as_ref().and_then(|id| targets.get(id)).cloned();
+    SlotOut {
+        slot: i as u32,
+        activity,
+        chunk_id,
+        chunk_type,
+        target_key,
+    }
+}
+
+fn settings_view(st: &AppState) -> SettingsView {
+    let s = st.settings_snapshot();
+    let key = s.resolved_public_key();
+    let creds_present = st.creds_path().exists();
+    let staging_mode = AppState::staging_mode(&s);
+    SettingsView {
+        coordinator_url: s.coordinator_url,
+        concurrency: s.concurrency,
+        dry_run: s.dry_run,
+        staging_mode,
+        public_key_configured: !key.is_empty(),
+        public_key_tail: if key.len() >= 6 {
+            key[key.len() - 6..].to_string()
+        } else {
+            String::new()
+        },
+        data_dir: st.data_dir.display().to_string(),
+        credentials_path: st.creds_path().display().to_string(),
+        credentials_present: creds_present,
+        client_id: st.credentials().map(|c| c.client_id),
+    }
+}
+
+fn validate_hex_key(k: &str) -> Result<(), String> {
+    if k.len() != 64 || !k.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("public key must be 64 hex characters (32-byte ed25519)".to_string());
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Commands
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn get_status(app: AppHandle) -> UiStatus {
+    let st = app.state::<AppState>();
+    let phase = st.phase();
+    let settings = st.settings_snapshot();
+    let error = guard(&st.last_error).clone();
+
+    let (stats, slots) = {
+        let active = guard(&st.active);
+        match active.as_ref() {
+            Some(run) => {
+                let snap = run.stats.snapshot();
+                let targets = guard(&st.lease_targets);
+                let slots = snap
+                    .slots
+                    .iter()
+                    .enumerate()
+                    .map(|(i, a)| slot_out(i, a, &targets))
+                    .collect();
+                (
+                    Some(StatsOut {
+                        chunks_completed: snap.chunks_completed,
+                        chunks_failed: snap.chunks_failed,
+                        chunks_verified: snap.chunks_verified,
+                        bytes_staged: snap.bytes_staged,
+                        uptime_secs: snap.uptime.as_secs(),
+                    }),
+                    slots,
+                )
+            }
+            None => (None, Vec::new()),
+        }
+    };
+
+    UiStatus {
+        phase: phase.as_str(),
+        error,
+        coordinator_ok: match st.coordinator_ok.load(Ordering::Relaxed) {
+            0 => None,
+            1 => Some(true),
+            _ => Some(false),
+        },
+        last_health_ok_ms: match st.last_health_ok_ms.load(Ordering::Relaxed) {
+            0 => None,
+            v => Some(v),
+        },
+        dry_run: settings.dry_run,
+        concurrency: settings.concurrency,
+        staging: AppState::staging_mode(&settings),
+        credentials_present: st.creds_path().exists(),
+        client_id: st.credentials().map(|c| c.client_id),
+        stats,
+        slots,
+        client_version: lh_contributor_client::client_version(),
+        gui_version: env!("CARGO_PKG_VERSION"),
+    }
+}
+
+#[tauri::command]
+pub fn start_contributor(app: AppHandle) -> Result<(), String> {
+    start(&app)
+}
+
+#[tauri::command]
+pub fn pause_contributor(app: AppHandle) -> Result<(), String> {
+    pause(&app)
+}
+
+#[tauri::command]
+pub fn resume_contributor(app: AppHandle) -> Result<(), String> {
+    match app.state::<AppState>().phase() {
+        Phase::Running | Phase::Starting | Phase::Stopping => {
+            Err("contributor loop already active — use Pause".to_string())
+        }
+        _ => start(&app),
+    }
+}
+
+#[tauri::command]
+pub async fn register_client(app: AppHandle) -> Result<String, String> {
+    let st = app.state::<AppState>();
+    if matches!(
+        st.phase(),
+        Phase::Running | Phase::Starting | Phase::Stopping
+    ) {
+        return Err("pause the contributor loop before re-registering".to_string());
+    }
+    let api = st.api_client()?;
+    let creds = api
+        .register(&register_request())
+        .await
+        .map_err(|e| format!("register failed: {e}"))?;
+    let path = save_credentials(&st.data_dir, &creds)
+        .map_err(|e| format!("could not persist credentials: {e}"))?;
+    *guard(&st.last_error) = None;
+    if st.phase() == Phase::Error {
+        st.set_phase(Phase::Idle);
+    }
+    Ok(format!(
+        "registered as {} (credentials saved to {})",
+        creds.client_id,
+        path.display()
+    ))
+}
+
+#[tauri::command]
+pub async fn check_coordinator(app: AppHandle) -> Result<String, String> {
+    let st = app.state::<AppState>();
+    let api = st.api_client()?;
+    match api.health().await {
+        Ok(h) => {
+            st.coordinator_ok.store(1, Ordering::Relaxed);
+            st.last_health_ok_ms.store(now_ms(), Ordering::Relaxed);
+            Ok(format!("coordinator healthy (server time {})", h.time))
+        }
+        Err(e) => {
+            st.coordinator_ok.store(2, Ordering::Relaxed);
+            Err(format!("coordinator unreachable: {e}"))
+        }
+    }
+}
+
+#[tauri::command]
+pub fn get_settings_view(app: AppHandle) -> SettingsView {
+    settings_view(&app.state::<AppState>())
+}
+
+#[tauri::command]
+pub fn save_settings(app: AppHandle, input: SettingsInput) -> Result<SettingsView, String> {
+    let st = app.state::<AppState>();
+    let mut s = st.settings_snapshot();
+    if let Some(u) = input.coordinator_url {
+        let u = u.trim().to_string();
+        if !(u.starts_with("http://") || u.starts_with("https://")) {
+            return Err("coordinator URL must start with http:// or https://".to_string());
+        }
+        s.coordinator_url = u;
+    }
+    if let Some(k) = input.public_key_hex {
+        let k = k.trim().to_string();
+        if !k.is_empty() {
+            validate_hex_key(&k)?;
+            s.public_key_hex = k;
+        }
+    }
+    if let Some(c) = input.concurrency {
+        if !(1..=8).contains(&c) {
+            return Err("concurrency must be between 1 and 8".to_string());
+        }
+        s.concurrency = c;
+    }
+    if let Some(d) = input.dry_run {
+        s.dry_run = d;
+    }
+    *guard(&st.settings) = s.clone();
+    settings::write(&st.data_dir, &s)?;
+    Ok(settings_view(&st))
+}
+
+#[tauri::command]
+pub fn quit_app(app: AppHandle) {
+    graceful_shutdown_and_exit(&app);
+}
