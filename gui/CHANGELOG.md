@@ -10,10 +10,6 @@ sync-version` stamps `package.json` + `src-tauri/Cargo.toml` (every
 - Release signing/notarization (NSIS `signCommand`, macOS
   `signingIdentity` + notarytool) — blocked on operator signing
   credentials, not on code.
-- `STRATA_DOCS_URL` in `src-tauri/src/hardware.rs` is a `<OPERATOR_FILL>`
-  sentinel: replace with the published Strata install-instructions URL
-  when it exists. Until then the hardware-advice Strata line renders
-  without a link (by design — no invented URLs).
 - Known pre-existing gap (flagged in card t_10daf382, deliberately not
   inherited): the sidecar Unix lifecycle **test** helpers (`libc::kill`,
   `Permissions::from_mode`) don't compile under a Windows *test* profile;

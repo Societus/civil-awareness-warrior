@@ -60,7 +60,7 @@ pub const MODEL_SOURCE_LABEL: &str = "ornith-ai/Ornith-1.5-9B-GGUF";
 /// install-instructions URL once the docs page exists. While it still holds
 /// the sentinel below, the Strata line renders WITHOUT a link — do not ship
 /// an invented URL.
-pub const STRATA_DOCS_URL: &str = "<OPERATOR_FILL>";
+pub const STRATA_DOCS_URL: &str = "https://github.com/Niko1221/Strata#install";
 
 // ────────────────────────────────────────────────────────────────────────────
 // Thresholds (GiB-based byte boundaries, inclusive)
@@ -772,10 +772,10 @@ mod tests {
     }
 
     #[test]
-    fn strata_line_is_the_exact_operators_shape_and_no_link_while_placeholder() {
+    fn strata_line_is_the_exact_operators_shape_and_links_the_install_docs() {
         assert!(
-            STRATA_DOCS_URL.contains("OPERATOR_FILL"),
-            "operator hasn't filled STRATA_DOCS_URL yet — tests must not pretend otherwise"
+            !STRATA_DOCS_URL.contains("OPERATOR_FILL"),
+            "operator filled STRATA_DOCS_URL — tests assert the filled state"
         );
         let a = advice_for(&facts("windows", false, Some(gib(128)), detected(gib(24))));
         assert_eq!(a.tier, "tier1_strata");
@@ -784,14 +784,13 @@ mod tests {
             "This machine could host Strata as a general-purpose local AI server for this app and everything else — note it consumes 41–51GB of RAM while running."
         ));
         assert!(line.text.contains("Custom endpoint → local server"));
-        assert!(line.link.is_none(), "no invented URL while the constant is a placeholder");
-        assert!(!line.text.contains(INLINE_LINK_MARKER));
-        assert_eq!(a.lines.len(), 2, "one tier-1 line + one Strata line, nothing more");
-        // Once filled, the inline link slot appears.
-        let filled = strata_link("https://docs.example.test/strata-install");
-        let link = filled.expect("filled URL yields a link");
+        let link = line.link.as_ref().expect("filled URL yields the install-docs link");
+        assert_eq!(link.url, STRATA_DOCS_URL);
         assert_eq!(link.label, "install instructions");
-        assert_eq!(link.url, "https://docs.example.test/strata-install");
+        // Filled URL ⇒ the UI renders the anchor inline at the marker slot.
+        assert!(line.text.contains(INLINE_LINK_MARKER));
+        assert!(line.text.contains("If you're interested:"));
+        assert_eq!(a.lines.len(), 2, "one tier-1 line + one Strata line, nothing more");
     }
 
     #[test]

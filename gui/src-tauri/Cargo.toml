@@ -9,7 +9,7 @@ license = "MIT"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-lh-contributor-client = { path = "../../lh-contributor-client" }
+lh-contributor-client = { path = "../../sdk" }
 tauri = { version = "2", features = ["tray-icon"] }
 # /public/stats.json poll (CORS blocks the webview; the Rust side fetches).
 # Same version/features as the client lib so cargo reuses one compiled reqwest;

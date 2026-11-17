@@ -1,8 +1,9 @@
 # lh-contributor-gui
 
-Tauri 2 graphical wrapper for the LandHunter contributor client
-(`lh-contributor-client`, embedded as a path dependency at
-`../lh-contributor-client`). Background-posture tray app: the window is a
+Tauri 2 graphical wrapper for the LandHunter contributor SDK
+(`lh-contributor-client`, embedded as a path dependency at `../../sdk` —
+this directory is the `gui/` subtree of the `lh-contributor` monorepo).
+Background-posture tray app: the window is a
 status dashboard; the warrior run loop lives in a background task and keeps
 running after the window is closed.
 
@@ -138,21 +139,15 @@ the three disagree. Releasing a new version means editing **one** file.
 
 ## Releasing (operator)
 
-**One-time setup** — this repo still has no remote; creating the GitHub
-side and pushing is deliberately the operator's step, not the CI's or a
-worker's:
+**One-time setup** — monorepo edition: `sdk/` and `gui/` live in ONE repo,
+so the release workflow needs a single checkout and no sibling-repo token:
 
-1. Create GitHub repos for **this** repo and for the SDK
-   (`lh-contributor-client`) **in the same org**: the release workflow
-   checks out `${{ github.repository_owner }}/lh-contributor-client`
-   beside this checkout, because `src-tauri/Cargo.toml` embeds the SDK as
-   a *path* dependency (`../../lh-contributor-client`). If you name or
-   park the SDK differently, edit the checkout step in
-   `.github/workflows/release.yml`.
-2. If the SDK repo is **private**, create a fine-grained PAT scoped to
-   that repo with read-only access and store it as this repo's repository
-   secret `LH_CONTRIBUTOR_CLIENT_TOKEN`. Public SDK → nothing to store
-   (the built-in `GITHUB_TOKEN` suffices).
+1. Create the GitHub repo (`lh-contributor`) in the org and push `main`
+   once. `.github/workflows/release.yml` (repo root) builds all three
+   platforms from that single checkout — the old sibling-repo checkout
+   step and `LH_CONTRIBUTOR_CLIENT_TOKEN` secret are gone.
+2. Tag `v0.1.0` and push the tag to trigger the release matrix; see
+   CHANGELOG.md for the full first-tag ritual.
 3. Push `main`, then follow the **release checklist in CHANGELOG.md**.
 
 What the pipeline (`.github/workflows/release.yml`) does on a `v*` tag
@@ -386,4 +381,4 @@ Notes:
   `get_status`) shares those rendering paths, but an actual Tauri window/tray
   session has still not been exercised on this headless box.
 - House rules: local repo only (no remote), `commit.gpgsign false`
-  repo-local, unsigned commits, `lh-contributor-client` is read-only here.
+  repo-local, unsigned commits, the SDK subtree (`sdk/`) is read-only from the GUI side.

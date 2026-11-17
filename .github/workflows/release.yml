@@ -6,19 +6,10 @@
 # tag. Nothing is signed/notarized here — that is a deliberate later
 # operator step (README documents how to bolt it on).
 #
-# Layout requirement: src-tauri/Cargo.toml embeds the SDK as a PATH
-# dependency at ../../lh-contributor-client — the same sibling-repo layout
-# the dev boxes use. This workflow therefore checks BOTH repos out into
-# sibling subdirectories of the runner workspace:
-#
-#   $GITHUB_WORKSPACE/lh-contributor-gui/        <- this repo
-#   $GITHUB_WORKSPACE/lh-contributor-client/     <- the SDK
-#
-# so that from src-tauri/, ../.. resolves to the workspace root and the
-# path dep compiles. The SDK is assumed to live in THIS repo's org under
-# the name lh-contributor-client; if you park it elsewhere, edit the
-# `repository:` line. If the SDK repo is private, store a read-only token
-# for it as the repository secret LH_CONTRIBUTOR_CLIENT_TOKEN.
+# Layout: this is the lh-contributor MONOREPO. The GUI lives at gui/
+# and the SDK at sdk/; src-tauri/Cargo.toml embeds the SDK as a PATH
+# dependency at ../../sdk, which a single checkout satisfies — no
+# sibling-repo checkout or token needed.
 name: Release
 
 on:
@@ -66,22 +57,13 @@ jobs:
     steps:
       - name: Checkout this repo
         uses: actions/checkout@v4
-        with:
-          path: lh-contributor-gui
-
-      - name: Checkout SDK (path dep at ../lh-contributor-client)
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ github.repository_owner }}/lh-contributor-client
-          token: ${{ secrets.LH_CONTRIBUTOR_CLIENT_TOKEN || secrets.GITHUB_TOKEN }}
-          path: lh-contributor-client
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: lh-contributor-gui/package-lock.json
+          cache-dependency-path: gui/package-lock.json
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -97,17 +79,17 @@ jobs:
             libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
 
       - name: npm ci
-        working-directory: lh-contributor-gui
+        working-directory: gui
         run: npm ci
 
       - name: Stamp the release version (tauri.conf.json is the source of truth)
-        working-directory: lh-contributor-gui
+        working-directory: gui
         run: |
           npm run sync-version
           npm run verify-version
 
       - name: Build bundles
-        working-directory: lh-contributor-gui
+        working-directory: gui
         run: npx tauri build ${{ matrix.tauri_extra }} --bundles ${{ matrix.bundles }}
 
       # Windows bonus artifact: the bare exe in a zip, for volunteers who
@@ -118,7 +100,7 @@ jobs:
       # }} is deliberately NOT interpolated into the pwsh line.
       - name: Portable zip (Windows)
         if: matrix.name == 'windows'
-        working-directory: lh-contributor-gui
+        working-directory: gui
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
@@ -129,7 +111,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: bundles-${{ matrix.name }}
-          path: lh-contributor-gui/src-tauri/target/release/bundle/**
+          path: gui/src-tauri/target/release/bundle/**
           if-no-files-found: error
           retention-days: 14
 
@@ -138,7 +120,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: bundles-${{ matrix.name }}-portable
-          path: lh-contributor-gui/dist/*.zip
+          path: gui/dist/*.zip
           if-no-files-found: error
           retention-days: 14
 
