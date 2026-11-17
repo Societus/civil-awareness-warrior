@@ -275,7 +275,7 @@ pub fn endpoint_port(cfg: &LocalModelCfg) -> u16 {
     if cfg.endpoint.trim().is_empty() {
         return DEFAULT_LLM_PORT;
     }
-    Url::parse(&cfg.endpoint.trim())
+    Url::parse(cfg.endpoint.trim())
         .ok()
         .and_then(|u| u.port().or_else(|| u.port_or_known_default()))
         .unwrap_or(DEFAULT_LLM_PORT)
@@ -350,16 +350,17 @@ pub async fn probe_endpoint(base: &str) -> Result<(), String> {
     let health_url = format!("{origin}/health");
     let models_url = format!("{base_norm}/models");
 
-    let last; // assigned in every arm that reaches the /v1/models probe
-    match client.get(&health_url).send().await {
+    // The health-probe failure message, carried into the models-probe
+    // error text (why we fell back).
+    let health_msg = match client.get(&health_url).send().await {
         Ok(r) if r.status().is_success() => return Ok(()),
-        Ok(r) => last = format!("GET {health_url} → {}", r.status()),
-        Err(e) => last = format!("GET {health_url} → {e}"),
-    }
+        Ok(r) => format!("GET {health_url} → {}", r.status()),
+        Err(e) => format!("GET {health_url} → {e}"),
+    };
     match client.get(&models_url).send().await {
         Ok(r) if r.status().is_success() => Ok(()),
-        Ok(r) => Err(format!("endpoint unreachable ({last}; GET {models_url} → {})", r.status())),
-        Err(e) => Err(format!("endpoint unreachable ({last}; GET {models_url} → {e})")),
+        Ok(r) => Err(format!("endpoint unreachable ({health_msg}; GET {models_url} → {})", r.status())),
+        Err(e) => Err(format!("endpoint unreachable ({health_msg}; GET {models_url} → {e})")),
     }
 }
 
@@ -760,13 +761,15 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["--parallel", "1"]));
         assert!(args.windows(2).any(|w| w == ["--host", "127.0.0.1"]));
         assert!(args.windows(2).any(|w| w == ["--port", "8081"]));
-        assert!(gpu_offload(c.cap) == false);
+        assert!(!gpu_offload(c.cap));
 
         c.cap = ResourceCap::CpuHalf;
         assert_eq!(cap_threads(c.cap, 5), Some(2));
         assert_eq!(cap_threads(c.cap, 1), Some(1), "max(1, floor(cores/2))");
         let args2 = launch_args(&c, Path::new("/m"), 8081);
-        assert!(args2.windows(2).any(|w| w == ["--threads", &((5usize / 2).max(1)).to_string()]));
+        // cap_threads(CpuHalf, 5) = max(1, floor(5/2)) = 2 — the max() arm
+        // is a no-op for this fixture, so the expected flag is the literal.
+        assert!(args2.windows(2).any(|w| w == ["--threads", "2"]));
 
         c.cap = ResourceCap::Gpu;
         assert_eq!(cap_threads(c.cap, cores), None);

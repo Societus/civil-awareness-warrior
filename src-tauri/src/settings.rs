@@ -561,7 +561,8 @@ impl GuiSettings {
         }
         // Invariant: classify follows the model mode. merge_settings keeps
         // them aligned; this catches hand-edited settings.json drift.
-        if self.capabilities.classify != !matches!(self.local_model.mode, LlmMode::None) {
+        // (Drift = classify is ON exactly when the mode is None.)
+        if self.capabilities.classify == matches!(self.local_model.mode, LlmMode::None) {
             return Err(FieldError::new(
                 "capabilities",
                 "the search-grading (classify) capability follows the Local Model setting — pick a model mode or switch the model off",

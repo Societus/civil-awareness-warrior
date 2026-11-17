@@ -155,8 +155,7 @@ struct ActiveRun {
     final_uptime_secs: u64,
 }
 
-/// Local Model lane bookkeeping lives in `sidecar::LaneState` (imported).
-
+// Local Model lane bookkeeping lives in `sidecar::LaneState` (imported).
 pub struct AppState {
     data_dir: PathBuf,
     settings: Mutex<GuiSettings>,

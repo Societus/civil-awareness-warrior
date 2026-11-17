@@ -6,6 +6,173 @@ Tauri 2 graphical wrapper for the LandHunter contributor client
 status dashboard; the warrior run loop lives in a background task and keeps
 running after the window is closed.
 
+## Installing (volunteers)
+
+Built installers live on this repository's **Releases** page (the release
+pipeline is described under [Releasing (operator)](#releasing-operator)).
+Pick your platform:
+
+- **Windows 10/11 (x64):** `lh-contributor-gui_<version>_x64-setup.exe`
+  — an NSIS installer that installs *for your user only* (no admin
+  rights, no system-wide footprint). Portable alternative:
+  `lh-contributor-gui-portable.zip` is the bare exe — unpack anywhere and
+  run; Windows 10+ already ships the WebView2 runtime the app needs.
+- **macOS 13+ (Apple Silicon or Intel):** the universal `.dmg` — open it
+  and drag **lh-contributor-gui.app** into Applications.
+- **Linux (x86_64):** the `.deb` (Debian/Ubuntu-family:
+  `sudo apt install ./lh-contributor-gui_<version>_amd64.deb`) or the
+  `.AppImage` (any modern distro: `chmod +x` and run; the first run adds
+  an applications-menu entry).
+
+Whichever you pick: this is a **tray app**. Closing the window hides it —
+the contributor stays reachable from the system tray, and quitting is via
+the tray menu (or the dashboard's Quit button). Nothing runs until you
+press Start (dry-run mode is the default).
+
+Releases are currently **unsigned** (signing/notarization is a documented
+operator follow-up): expect Gatekeeper's right-click → Open prompt the
+first time on macOS, and SmartScreen's "More info → Run anyway" on
+Windows, until release artifacts carry signatures.
+
+## Requirements (volunteers)
+
+Same numbers as the coordinator landing page's Requirements section
+(cap.landhunter.app — the two pages are deliberately kept mirrored), plus
+GUI-specific extras:
+
+- **Minimum:** 64-bit CPU (x86_64 or ARM64) · 512 MB available RAM ·
+  1 GB free disk for staging · outbound HTTPS (443) · Linux /
+  macOS 13+ (the GUI floor; the coordinator's CLI floor is lower) /
+  Windows 10+.
+- **Recommended:** 2+ CPU cores · 2 GB+ RAM · 5 GB+ free disk · unmetered
+  or high-capacity internet · always-on or scheduled uptime.
+- **Network:** no inbound ports · outbound only, to the coordinator and
+  chunk target hosts · politeness cap ≤30 req/min per target host · no
+  VPN/proxy needed (residential IPs preferred for some GIS lookups).
+- **GUI extras — only if you opt into Local Model grading:** a
+  llama-server binary (from llama.cpp) on PATH or set explicitly in
+  Settings ▸ Local Model; the default pinned model downloads 1.1 GB, the
+  opt-in 9B model 5.8 GB. Rough 9B floor: ≥10 GiB dedicated GPU VRAM or
+  ≥24 GB unified memory. Settings ▸ Local Model ▸ **"Can I AI?"** reads
+  your RAM/VRAM when you click it (read-only, nothing stored or sent)
+  and tells you which model tier your machine can host.
+
+## Autostart (launch at login)
+
+**Default: off.** The only switch is Settings ▸ System ▸ "Launch at
+login" — deliberately not env-seedable, because registering a login entry
+is a human action. When on, the app registers a **per-user** entry:
+
+| Platform | Where the entry lives |
+| --- | --- |
+| Windows | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` value |
+| Linux | `~/.config/autostart/lh-contributor-gui.desktop` (XDG autostart; the AppImage registers the AppImage itself, the deb package registers the installed binary) |
+| macOS | LaunchAgent plist in `~/Library/LaunchAgents` (label `app.landhunter.contributor-gui`) |
+
+How it stays honest:
+
+- Flipping the checkbox applies the OS entry **before** settings.json is
+  written; if the OS write fails the save aborts, so settings.json never
+  claims an autostart state the OS does not have.
+- Every launch re-applies the persisted intent and **re-points the entry
+  at the binary actually running**: a hand-deleted entry re-registers on
+  the next launch, and a stale entry from an old install path (or a dev
+  build) is corrected rather than left to rot.
+- Autostart starts the **tray app, idle**. Starting an actual contributor
+  run remains a human Start press; the schedule watcher only pauses /
+  resumes a loop that is already live in the current session.
+
+### macOS notes (LaunchAgent / LaunchDaemon patterns)
+
+The in-app switch writes a LaunchAgent: per-user, starting at *GUI
+login*. Known caveats:
+
+- A LaunchAgent lives in the user's Aqua (GUI) session. Recent macOS
+  (26+) refuses `launchctl bootstrap gui/<uid>` from a plain ssh session
+  — load from a Terminal **inside a logged-in console session**, or just
+  use the in-app checkbox (the app self-registering from inside its own
+  GUI session is exactly the supported context).
+- A root LaunchDaemon (`/Library/LaunchDaemons`, starts at boot with no
+  login) can start the binary on a headless Mac, but Tauri windows and
+  tray icons need a window-server connection: expect the GUI layer to
+  fail or run invisibly without a logged-in session. Test before trusting
+  it — the reliable headless-Mac patterns are console auto-login +
+  LaunchAgent, or running the contributor **CLI** instead of the GUI.
+
+Manual patterns (from a console Terminal; the in-app switch effectively
+does the same):
+
+```sh
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/app.landhunter.contributor-gui.plist
+launchctl print   gui/$(id -u)/app.landhunter.contributor-gui  # status
+launchctl bootout gui/$(id -u)/app.landhunter.contributor-gui  # unload
+```
+
+LaunchDaemon variant: copy the plist the app wrote into
+`/Library/LaunchDaemons/`, add a `UserName` key pinned to the intended
+account, then `launchctl bootstrap system /Library/LaunchDaemons/app.landhunter.contributor-gui.plist`
+— with the GUI caveat above.
+
+## Upgrading
+
+There is **no in-app updater** on purpose (no update feed yet). Upgrade =
+install the newest release over the old:
+
+- Windows: run the new `-setup.exe` — it installs in place.
+- macOS: drag the new app onto the old one in Applications.
+- Linux: `sudo apt install ./<new>.deb`, or just replace the AppImage file.
+
+App state (see *Credentials & data location*) is never touched by
+install or uninstall: registration identity, settings, and **downloaded
+model files stay verified across upgrades** — no re-download, no
+re-verify. The per-user autostart entry survives too; the next launch
+re-points it at the new binary.
+
+## Versioning
+
+`src-tauri/tauri.conf.json → version` is the single source of truth.
+`npm run sync-version` stamps `package.json` and `src-tauri/Cargo.toml`
+(also runs automatically inside every `tauri build` via
+`beforeBuildCommand`); `npm run verify-version` fails loudly if any of
+the three disagree. Releasing a new version means editing **one** file.
+
+## Releasing (operator)
+
+**One-time setup** — this repo still has no remote; creating the GitHub
+side and pushing is deliberately the operator's step, not the CI's or a
+worker's:
+
+1. Create GitHub repos for **this** repo and for the SDK
+   (`lh-contributor-client`) **in the same org**: the release workflow
+   checks out `${{ github.repository_owner }}/lh-contributor-client`
+   beside this checkout, because `src-tauri/Cargo.toml` embeds the SDK as
+   a *path* dependency (`../../lh-contributor-client`). If you name or
+   park the SDK differently, edit the checkout step in
+   `.github/workflows/release.yml`.
+2. If the SDK repo is **private**, create a fine-grained PAT scoped to
+   that repo with read-only access and store it as this repo's repository
+   secret `LH_CONTRIBUTOR_CLIENT_TOKEN`. Public SDK → nothing to store
+   (the built-in `GITHUB_TOKEN` suffices).
+3. Push `main`, then follow the **release checklist in CHANGELOG.md**.
+
+What the pipeline (`.github/workflows/release.yml`) does on a `v*` tag
+push: builds **Linux** (deb + AppImage), **Windows** (NSIS installer +
+portable zip) and **macOS** (universal dmg, arm64+x86_64, on the
+macos-14 runner) in parallel, then publishes one GitHub Release named
+`LandHunter Contributor <tag>` carrying every artifact — as a full
+(non-prerelease) release.
+
+Artifacts are **not code-signed/notarized yet** — the next operator
+milestone once signing credentials exist: `bundle.windows.nsis`
+`signCommand`, and macOS `signingIdentity` + notarytool credentials in
+the bundle config (both documented in Tauri's publishing guide). Until
+then the Gatekeeper/SmartScreen caveats from *Installing* apply.
+
+`workflow_dispatch` (the "Run workflow" button) executes the same
+pipeline and publishes it as a **prerelease named after the ref it was
+dispatched from** — a pipeline dry-run; delete the throwaway tag/release
+afterward.
+
 ## Dev
 
 ```sh
@@ -119,16 +286,29 @@ Wired:
   id and restarts the registration state; the coordinator exposes no revoke
   endpoint, so open leases simply lapse and requeue for other volunteers —
   stated verbatim in the UI.
-- **Advanced** section is an explicit placeholder for the LLM-chunk card's
-  options (local model opt-in, resource caps, model status).
+- **Local Model lane** (Settings ▸ Local Model; cards t_3067589d +
+  t_10daf382): three modes (None / Auto bundled sidecar / Custom
+  OpenAI-compatible endpoint), sha256-pinned resumable GGUF download
+  (default 2B, opt-in 9B, per-model download state), resource-capped
+  llama-server spawn with orphan-proof lifecycle, API key in its own 0600
+  side file, health-gated classify capability, and a click-only
+  "Can I AI?" hardware advisor.
+- **Launch at login** (card t_f9279e25): the Settings ▸ System checkbox
+  drives the OS entry via tauri-plugin-autostart — HKCU Run value
+  (Windows), XDG autostart .desktop (Linux, AppImage-aware), LaunchAgent
+  plist (macOS). Applied on save *before* settings.json is written, and
+  re-pointed at the running binary on every startup. See the *Autostart*
+  section above for semantics and the macOS console-login caveats.
 
 Stubbed / not yet here:
 
 - R2 / presigned-upload staging config is **env-only**, not settings UI
   (see env table). Real (non-dry) runs without it refuse to start with the
   lib's own error surfaced in the banner.
-- No auto-start on launch (settings/register first), no OS autostart,
-  no updater.
+- No autostart of the *run loop* itself: launch-at-login starts the tray
+  app idle, and Start stays a human press. No in-app updater (upgrade =
+  install the newest release; data and models survive in place). OS
+  autostart landed with card t_f9279e25.
 
 ## Credentials & data location
 

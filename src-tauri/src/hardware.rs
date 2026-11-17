@@ -349,7 +349,7 @@ fn sysctl_read(key: &str) -> Option<String> {
 /// Parse a sysctl value (`-n` bare number, or `key: value`) as u64.
 #[cfg(any(test, target_os = "macos"))]
 pub fn parse_sysctl_u64(text: &str) -> Option<u64> {
-    let token = text.trim().split_whitespace().last()?;
+    let token = text.split_whitespace().last()?;
     token.parse::<u64>().ok()
 }
 
