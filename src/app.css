@@ -650,6 +650,29 @@ button.danger.armed {
 	overflow-wrap: break-word;
 }
 
+/* "Can I AI?" hardware advisor (t_10daf382): click-only probe report. */
+.hw-advisor {
+	margin-top: 14px;
+	padding-top: 12px;
+	border-top: 1px dashed var(--border-strong);
+}
+.hw-advisor-row {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+}
+.hw-advisor-row .fine {
+	flex: 1;
+}
+.hw-result .hw-line {
+	margin-top: 8px;
+}
+.hw-link {
+	color: var(--accent);
+	text-decoration: underline;
+	overflow-wrap: anywhere;
+}
+
 details summary {
 	font-size: 12.5px;
 	font-weight: 600;

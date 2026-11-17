@@ -2,5 +2,13 @@
   "identifier": "default",
   "description": "Capabilities for the main contributor window (app-local commands only).",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": [
+    "core:default",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        { "url": "https://huggingface.co/**" }
+      ]
+    }
+  ]
 }

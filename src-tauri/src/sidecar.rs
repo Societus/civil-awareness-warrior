@@ -39,9 +39,11 @@ use crate::settings::{LocalModelCfg, ResourceCap};
 /// Default sidecar port (the SDK's DEFAULT_LLM_BASE_URL points here).
 pub const DEFAULT_LLM_PORT: u16 = 8081;
 
-/// The one bundled model choice. All fields are primary-source facts from
+/// One bundled Auto-configure model choice — the full menu lives in
+/// `bundled_models()`. All fields are primary-source facts from
 /// `GET https://huggingface.co/api/models/Qwen/Qwen2.5-1.5B-Instruct-GGUF?blobs=true`
 /// (file name, exact byte size, lfs.sha256, license=apache-2.0).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelSpec {
     pub id: &'static str,
     pub label: &'static str,
@@ -70,6 +72,44 @@ pub const DEFAULT_MODEL: ModelSpec = ModelSpec {
     sha256: "6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e",
 };
 
+/// Second, OPT-IN Auto-configure choice: the "ornith-1.5-9b-class" model the
+/// "Can I AI?" advisor (hardware.rs) names for machines whose probe shows the
+/// operator-proven tier-1 config (≥10 GiB dedicated VRAM or ≥24 GiB unified
+/// memory). All fields are primary-source facts from
+/// `GET https://huggingface.co/api/models/ornith-ai/Ornith-1.5-9B-GGUF?blobs=true`
+/// (file name, exact byte size, lfs sha256, license=mit), re-verified
+/// 2026-11-17. The smaller default model above stays the default; this one
+/// is a selectable choice, never a silent switch (Settings ▸ Local Model ▸
+/// Bundled model).
+pub const LARGE_MODEL: ModelSpec = ModelSpec {
+    id: "ornith-1.5-9b-q4_k_m",
+    label: "Ornith-1.5-9B",
+    family: "Ornith",
+    quant: "Q4_K_M",
+    license: "MIT",
+    repo: "ornith-ai/Ornith-1.5-9B-GGUF",
+    file: "ornith-1.5-9b-q4_k_m.gguf",
+    url: "https://huggingface.co/ornith-ai/Ornith-1.5-9B-GGUF/resolve/main/ornith-1.5-9b-q4_k_m.gguf",
+    bytes_hint: 5_780_090_816,
+    sha256: "7ae5846389f612735899b85f8586b70059f0260d21248883d39fe755f878dcf5",
+};
+
+/// The bundled model menu, selection order (index 0 = the default). The
+/// Rust list is the ground truth; SettingsDialog renders it from
+/// SettingsView.bundled_models (settings-util.js mirrors it for the demo).
+pub fn bundled_models() -> Vec<&'static ModelSpec> {
+    vec![&DEFAULT_MODEL, &LARGE_MODEL]
+}
+
+/// Resolve the configured bundled model id (LocalModelCfg.model_id).
+/// Unknown ids resolve to None HERE — settings.rs normalizes them to the
+/// pinned default at load/save time, so a hand-edited settings.json can
+/// never steer the sidecar toward an unpinned model.
+pub fn model_for_id(id: &str) -> Option<&'static ModelSpec> {
+    let id = id.trim();
+    bundled_models().into_iter().find(|m| m.id == id)
+}
+
 pub fn models_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("models")
 }
@@ -82,7 +122,17 @@ fn part_path(data_dir: &Path, spec: &ModelSpec) -> PathBuf {
     models_dir(data_dir).join(format!("{}.part", spec.file))
 }
 
-fn state_path(data_dir: &Path) -> PathBuf {
+/// Download bookkeeping lives in ONE FILE PER MODEL — switching the bundled
+/// model must never invalidate an already-verified different model, and two
+/// models' resume state can't clobber each other.
+fn state_path(data_dir: &Path, spec: &ModelSpec) -> PathBuf {
+    models_dir(data_dir).join(format!("download_state-{}.json", spec.id))
+}
+
+/// The single state file the original sidecar card shipped. A record in it
+/// that matches the requested model is copied forward to the per-model file
+/// once; a record for any OTHER model is never honored (load_state).
+fn legacy_state_path(data_dir: &Path) -> PathBuf {
     models_dir(data_dir).join("download_state.json")
 }
 
@@ -100,14 +150,29 @@ pub struct DownloadState {
     pub error: Option<String>,
 }
 
-pub fn load_state(data_dir: &Path) -> Option<DownloadState> {
-    fs::read_to_string(state_path(data_dir))
+pub fn load_state(data_dir: &Path, spec: &ModelSpec) -> Option<DownloadState> {
+    if let Some(state) = fs::read_to_string(state_path(data_dir, spec))
         .ok()
         .and_then(|t| serde_json::from_str::<DownloadState>(&t).ok())
+    {
+        return Some(state);
+    }
+    // One-time migration from the legacy single-file state: only a record
+    // that names THIS model counts, and it is copied forward (the legacy
+    // file is left alone — harmless, never read again once a per-model file
+    // exists).
+    let migrated = fs::read_to_string(legacy_state_path(data_dir))
+        .ok()
+        .and_then(|t| serde_json::from_str::<DownloadState>(&t).ok())
+        .filter(|s| s.model_id == spec.id);
+    if let Some(state) = &migrated {
+        save_state(data_dir, state);
+    }
+    migrated
 }
 
 fn save_state(data_dir: &Path, state: &DownloadState) {
-    let path = state_path(data_dir);
+    let path = models_dir(data_dir).join(format!("download_state-{}.json", state.model_id));
     let _ = fs::create_dir_all(models_dir(data_dir));
     if let Ok(json) = serde_json::to_string_pretty(state) {
         let _ = fs::write(&path, json);
@@ -118,7 +183,7 @@ fn save_state(data_dir: &Path, state: &DownloadState) {
 /// it (a stray/corrupt file of the same name is re-downloaded, not trusted).
 pub fn model_is_ready(data_dir: &Path, spec: &ModelSpec) -> bool {
     let path = model_path(data_dir, spec);
-    path.is_file() && load_state(data_dir).is_some_and(|s| s.finished && s.model_id == spec.id)
+    path.is_file() && load_state(data_dir, spec).is_some_and(|s| s.finished && s.model_id == spec.id)
 }
 
 pub fn on_disk_bytes(data_dir: &Path, spec: &ModelSpec) -> u64 {
@@ -444,7 +509,7 @@ pub fn delete_model(data_dir: &Path, spec: &ModelSpec) -> u64 {
     let freed = on_disk_bytes(data_dir, spec);
     let _ = fs::remove_file(model_path(data_dir, spec));
     let _ = fs::remove_file(part_path(data_dir, spec));
-    let _ = fs::remove_file(state_path(data_dir));
+    let _ = fs::remove_file(state_path(data_dir, spec));
     freed
 }
 
@@ -492,7 +557,7 @@ pub async fn download_model(
     let final_path = model_path(data_dir, spec);
     let part = part_path(data_dir, spec);
 
-    let mut state = load_state(data_dir).filter(|s| s.model_id == spec.id).unwrap_or(DownloadState {
+    let mut state = load_state(data_dir, spec).unwrap_or(DownloadState {
         model_id: spec.id.to_string(),
         done_bytes: 0,
         total_bytes: spec.bytes_hint,
@@ -789,6 +854,111 @@ mod tests {
     }
 
     #[test]
+    fn state_records_are_per_model_across_a_model_switch() {
+        let dir = std::env::temp_dir().join("lhc-sidecar-state-per-model");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(models_dir(&dir)).unwrap();
+        fs::write(model_path(&dir, &DEFAULT_MODEL), b"default-gguf").unwrap();
+        save_state(
+            &dir,
+            &DownloadState {
+                model_id: DEFAULT_MODEL.id.to_string(),
+                done_bytes: 9,
+                total_bytes: 9,
+                finished: true,
+                error: None,
+            },
+        );
+        assert!(model_is_ready(&dir, &DEFAULT_MODEL));
+        // A finished download record for the OTHER bundled model neither
+        // vouches for the default model nor overwrites its record.
+        save_state(
+            &dir,
+            &DownloadState {
+                model_id: LARGE_MODEL.id.to_string(),
+                done_bytes: 1,
+                total_bytes: 1,
+                finished: true,
+                error: None,
+            },
+        );
+        assert!(
+            model_is_ready(&dir, &DEFAULT_MODEL),
+            "the default model's record survives a 9B download untouched"
+        );
+        assert!(!model_is_ready(&dir, &LARGE_MODEL), "no 9B file on disk yet");
+        fs::write(model_path(&dir, &LARGE_MODEL), b"nine-b-gguf").unwrap();
+        assert!(model_is_ready(&dir, &LARGE_MODEL));
+        // Deleting one model's file+record leaves the other model intact.
+        assert!(delete_model(&dir, &LARGE_MODEL) > 0);
+        assert!(model_is_ready(&dir, &DEFAULT_MODEL));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_single_state_file_migrates_per_model_without_cross_vouching() {
+        let dir = std::env::temp_dir().join("lhc-sidecar-state-migrate");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(models_dir(&dir)).unwrap();
+        fs::write(model_path(&dir, &DEFAULT_MODEL), b"legacy-gguf").unwrap();
+        fs::write(
+            legacy_state_path(&dir),
+            serde_json::to_string(&DownloadState {
+                model_id: DEFAULT_MODEL.id.to_string(),
+                done_bytes: 3,
+                total_bytes: 3,
+                finished: true,
+                error: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            model_is_ready(&dir, &DEFAULT_MODEL),
+            "the legacy record is read once and copied forward"
+        );
+        assert!(
+            state_path(&dir, &DEFAULT_MODEL).is_file(),
+            "the per-model record now exists"
+        );
+        assert!(
+            load_state(&dir, &LARGE_MODEL).is_none(),
+            "a legacy record never vouches for a different model"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bundled_menu_resolves_ids_and_holds_the_verified_nine_b_pin() {
+        let ids: Vec<&str> = bundled_models().iter().map(|m| m.id).collect();
+        assert_eq!(
+            ids,
+            vec![DEFAULT_MODEL.id, LARGE_MODEL.id],
+            "index 0 stays the default 2B-class file; the 9B is opt-in"
+        );
+        assert_eq!(model_for_id(LARGE_MODEL.id).map(|m| m.file), Some(LARGE_MODEL.file));
+        assert_eq!(
+            model_for_id("  ornith-1.5-9b-q4_k_m  ").map(|m| m.id),
+            Some(LARGE_MODEL.id),
+            "paste noise tolerated at the seam (settings.rs canonicalizes separately)"
+        );
+        assert_eq!(model_for_id(""), None);
+        assert_eq!(model_for_id("not-a-model"), None, "unknown ids never resolve — settings.rs normalizes them to the pinned default");
+
+        let c = model_caption(&LARGE_MODEL);
+        assert!(c.contains("Ornith-1.5-9B"));
+        assert!(c.contains("Q4_K_M"));
+        assert!(c.contains("5.8 GB"), "the ~6 GB Q4 size the card promises to show");
+        assert!(c.contains("MIT"));
+        // Pin facts as pulled from the HF blob API 2026-11-17 (exact byte
+        // size + lfs sha256 + file name) — a silently changed upstream file
+        // must not slip in unverified.
+        assert_eq!(LARGE_MODEL.bytes_hint, 5_780_090_816);
+        assert_eq!(LARGE_MODEL.sha256, "7ae5846389f612735899b85f8586b70059f0260d21248883d39fe755f878dcf5");
+        assert_eq!(LARGE_MODEL.file, "ornith-1.5-9b-q4_k_m.gguf");
+    }
+
+    #[test]
     fn model_caption_carries_size_and_license() {
         let c = model_caption(&DEFAULT_MODEL);
         assert!(c.contains("Qwen2.5"));
@@ -964,7 +1134,7 @@ mod tests {
         assert!(last_done >= fixture.len() as u64 - 1, "progress callbacks advanced");
         assert!(model_is_ready(&data_dir, &spec));
         assert!(!part_path(&data_dir, &spec).exists(), ".part is renamed away");
-        let state = load_state(&data_dir).expect("state");
+        let state = load_state(&data_dir, &spec).expect("state");
         assert!(state.finished);
         assert_eq!(state.total_bytes, fixture.len() as u64);
         let _ = fs::remove_dir_all(&data_dir);
@@ -1022,7 +1192,7 @@ mod tests {
         assert!(err.contains("sha256 mismatch"), "{err}");
         assert!(!part_path(&data_dir, &spec).exists(), "bad file must be discarded");
         assert!(!model_is_ready(&data_dir, &spec));
-        let state = load_state(&data_dir).expect("state");
+        let state = load_state(&data_dir, &spec).expect("state");
         assert!(state.error.is_some());
         let _ = fs::remove_dir_all(&data_dir);
     }

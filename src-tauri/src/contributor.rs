@@ -393,6 +393,15 @@ impl AppState {
         }
     }
 
+    /// The ModelSpec the persisted settings steer in Auto mode. Unknown or
+    /// empty ids are canonicalized to the pinned default on every load/save
+    /// (settings::normalize_local_model), so the unwrap_or here is
+    /// belt-and-braces; it never steers toward an unpinned model.
+    fn active_model(&self) -> &'static sidecar::ModelSpec {
+        sidecar::model_for_id(&self.settings_snapshot().local_model.model_id)
+            .unwrap_or(&DEFAULT_MODEL)
+    }
+
     /// Stop (SIGTERM→SIGKILL, always reaped) our sidecar child if any, then
     /// re-derive the lane: model on disk → `model_ready` (it comes back with
     /// the next loop start), otherwise honest off/missing state.
@@ -401,7 +410,7 @@ impl AppState {
             sidecar::stop_child(child);
         }
         let auto = self.settings_snapshot().local_model.mode == LlmMode::Auto;
-        let model_ready = sidecar::model_is_ready(&self.data_dir, &DEFAULT_MODEL);
+        let model_ready = sidecar::model_is_ready(&self.data_dir, self.active_model());
         let mut lane = guard(&self.lane);
         lane.pid = None;
         lane.spawned_by_us = false;
@@ -454,8 +463,9 @@ impl AppState {
                 }
             }
             LlmMode::Auto => {
+                let spec = self.active_model();
                 // 1. Model on disk, verified by a finished download state?
-                if !sidecar::model_is_ready(&self.data_dir, &DEFAULT_MODEL) {
+                if !sidecar::model_is_ready(&self.data_dir, spec) {
                     if self.download_active.load(Ordering::Relaxed) {
                         let prog = {
                             let lane = guard(&self.lane);
@@ -471,7 +481,7 @@ impl AppState {
                     self.set_lane(LaneStatus::ModelMissing, None);
                     return Err(format!(
                         "the bundled model is not downloaded yet — it normally starts automatically when Auto-configure is saved; press Download model under Settings ▸ Local Model, then Start (bundled choice: {})",
-                        sidecar::model_caption(&DEFAULT_MODEL)
+                        sidecar::model_caption(spec)
                     ));
                 }
                 // 2. Already healthy with our live child? Fast path.
@@ -510,7 +520,7 @@ impl AppState {
                 if let Some(child) = stale {
                     sidecar::stop_child(child);
                 }
-                let child = match sidecar::spawn_sidecar(&lm, &self.data_dir, &DEFAULT_MODEL) {
+                let child = match sidecar::spawn_sidecar(&lm, &self.data_dir, spec) {
                     Ok(c) => c,
                     Err(e) => {
                         self.set_lane(LaneStatus::Unhealthy, Some(e.clone()));
@@ -560,16 +570,17 @@ impl AppState {
     /// (`ensure_llm_ready` decides WHEN it is used; health gates it).
     fn build_llm_config(&self) -> Option<LlmConfig> {
         let lm = self.settings_snapshot().local_model.clone();
+        let auto_spec = sidecar::model_for_id(&lm.model_id).unwrap_or(&DEFAULT_MODEL);
         match lm.mode {
             LlmMode::None => None,
             LlmMode::Auto => Some(LlmConfig {
                 base_url: sidecar::resolved_endpoint(&lm),
                 api_key: None,
-                model: DEFAULT_MODEL.id.to_string(),
+                model: auto_spec.id.to_string(),
                 timeout_secs: LLM_TIMEOUT_SECS,
                 capability: LlmCapability {
-                    model_family: DEFAULT_MODEL.family.to_string(),
-                    quant: Some(DEFAULT_MODEL.quant.to_string()),
+                    model_family: auto_spec.family.to_string(),
+                    quant: Some(auto_spec.quant.to_string()),
                     ctx_tokens: lm.ctx_tokens,
                     // Honest declaration: `local-sidecar` only for a sidecar
                     // WE started; a healthy server the volunteer runs
@@ -999,7 +1010,7 @@ async fn sidecar_monitor(st: &Arc<AppState>) {
 /// Kick off the bundled-model download (no-op when one is in flight).
 /// Progress flows into the lane so the Settings model row live-refreshes;
 /// success lands the verified file and flips the lane to `model_ready`.
-fn start_model_download(st: &Arc<AppState>) {
+fn start_model_download(st: &Arc<AppState>, spec: &'static sidecar::ModelSpec) {
     if st.download_active.swap(true, Ordering::Relaxed) {
         return;
     }
@@ -1007,13 +1018,13 @@ fn start_model_download(st: &Arc<AppState>) {
         let mut lane = guard(&st.lane);
         lane.status = LaneStatus::Downloading;
         lane.detail = None;
-        lane.progress = Some((0, DEFAULT_MODEL.bytes_hint));
+        lane.progress = Some((0, spec.bytes_hint));
     }
     let st2 = st.clone();
     tauri::async_runtime::spawn(async move {
         let result = sidecar::download_model(
             &st2.data_dir,
-            &DEFAULT_MODEL,
+            spec,
             |p| {
                 let mut lane = guard(&st2.lane);
                 lane.status = LaneStatus::Downloading;
@@ -1029,7 +1040,7 @@ fn start_model_download(st: &Arc<AppState>) {
                 lane.progress = None;
                 lane.detail = Some(format!(
                     "bundled model verified ({} MB) → {}",
-                    sidecar::on_disk_bytes(&st2.data_dir, &DEFAULT_MODEL) / 1_048_576,
+                    sidecar::on_disk_bytes(&st2.data_dir, spec) / 1_048_576,
                     path.display()
                 ));
             }
@@ -1051,6 +1062,7 @@ fn llm_view(st: &AppState) -> LlmView {
     let sidecar_running = st.sidecar_child_alive();
     let s = st.settings_snapshot();
     let lm = s.local_model;
+    let active_spec = sidecar::model_for_id(&lm.model_id).unwrap_or(&DEFAULT_MODEL);
     let lane = guard(&st.lane);
     let progress = lane.progress.map(|(d, t)| LlmProgressOut {
         done_bytes: d,
@@ -1073,7 +1085,7 @@ fn llm_view(st: &AppState) -> LlmView {
         progress,
         model_line: match lm.mode {
             LlmMode::None => None,
-            LlmMode::Auto => Some(sidecar::model_caption(&DEFAULT_MODEL)),
+            LlmMode::Auto => Some(sidecar::model_caption(active_spec)),
             LlmMode::Custom => {
                 let name = lm.model_name.trim();
                 Some(if name.is_empty() {
@@ -1084,7 +1096,7 @@ fn llm_view(st: &AppState) -> LlmView {
             }
         },
         model_bytes_on_disk: if lm.mode == LlmMode::Auto {
-            Some(sidecar::on_disk_bytes(&st.data_dir, &DEFAULT_MODEL))
+            Some(sidecar::on_disk_bytes(&st.data_dir, active_spec))
         } else {
             None
         },
@@ -1346,7 +1358,22 @@ pub struct SettingsView {
     /// The persisted Local Model config (form initial values). The API key
     /// is deliberately absent — SettingsView exposes only `llm` (LlmView).
     pub local_model: settings::LocalModelCfg,
+    /// The Auto-configure bundled model menu straight from
+    /// sidecar::bundled_models (index 0 = the default). The Rust list is the
+    /// ground truth the Settings select renders; settings-util.js mirrors it
+    /// only so the browser demo shows the same shape.
+    pub bundled_models: Vec<BundledModelOut>,
     pub llm: LlmView,
+}
+
+#[derive(Serialize)]
+pub struct BundledModelOut {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub quant: &'static str,
+    /// Exact file bytes from the pinned ModelSpec.
+    pub bytes: u64,
+    pub license: &'static str,
 }
 
 #[derive(Deserialize)]
@@ -1369,6 +1396,11 @@ pub struct ScheduleIn {
 pub struct LocalModelIn {
     pub mode: Option<String>,
     pub cap: Option<String>,
+    /// Auto mode: which bundled model id to steer — a sidecar::bundled_models
+    /// id. Empty/unknown canonicalizes to the pinned default
+    /// (normalize_local_model); the default 2B-class file is what an absent
+    /// field keeps.
+    pub model_id: Option<String>,
     pub endpoint: Option<String>,
     pub llama_server_bin: Option<String>,
     pub model_name: Option<String>,
@@ -1456,6 +1488,9 @@ fn merge_settings(current: &GuiSettings, input: &SettingsInput) -> GuiSettings {
         if let Some(n) = &lm.model_name {
             s.local_model.model_name = n.trim().to_string();
         }
+        if let Some(m) = &lm.model_id {
+            s.local_model.model_id = m.trim().to_string();
+        }
         if let Some(c) = lm.ctx_tokens {
             s.local_model.ctx_tokens = c;
         }
@@ -1515,6 +1550,16 @@ fn settings_view(st: &AppState) -> SettingsView {
         credentials_present: creds_present,
         client_id: st.credentials().map(|c| c.client_id),
         local_model: s.local_model.clone(),
+        bundled_models: sidecar::bundled_models()
+            .into_iter()
+            .map(|m| BundledModelOut {
+                id: m.id,
+                label: m.label,
+                quant: m.quant,
+                bytes: m.bytes_hint,
+                license: m.license,
+            })
+            .collect(),
         llm: llm_view(st),
     }
 }
@@ -1721,20 +1766,21 @@ pub fn download_local_model(app: AppHandle) -> Result<String, String> {
                 .to_string(),
         );
     }
-    if sidecar::model_is_ready(&st.data_dir, &DEFAULT_MODEL) {
+    let spec = st.active_model();
+    if sidecar::model_is_ready(&st.data_dir, spec) {
         st.set_lane(LaneStatus::ModelReady, None);
         return Ok(format!(
             "bundled model already downloaded and verified: {}",
-            sidecar::model_caption(&DEFAULT_MODEL)
+            sidecar::model_caption(spec)
         ));
     }
     if st.download_active.load(Ordering::Relaxed) {
         return Ok("download already in progress — the model row shows progress".to_string());
     }
-    start_model_download(&st);
+    start_model_download(&st, spec);
     Ok(format!(
         "download started: {} (resumable, sha256-verified)",
-        sidecar::model_caption(&DEFAULT_MODEL)
+        sidecar::model_caption(spec)
     ))
 }
 
@@ -1754,7 +1800,7 @@ pub fn delete_local_model(app: AppHandle) -> Result<String, String> {
     if st.sidecar_child_alive() {
         st.stop_sidecar();
     }
-    let freed = sidecar::delete_model(&st.data_dir, &DEFAULT_MODEL);
+    let freed = sidecar::delete_model(&st.data_dir, st.active_model());
     let auto = st.settings_snapshot().local_model.mode == LlmMode::Auto;
     st.set_lane(
         if auto {
@@ -1854,11 +1900,19 @@ pub fn save_settings(
         if now_auto && prev_lm.mode != LlmMode::Auto {
             // First enable: the card's "first enable downloads" step —
             // start the bundled model download immediately so the Settings
-            // model row can show progress without waiting for Start.
-            start_model_download(&st);
+            // model row can progress without waiting for Start.
+            start_model_download(&st, sidecar::model_for_id(&now_lm.model_id).unwrap_or(&DEFAULT_MODEL));
+        } else if now_auto && prev_lm.model_id != now_lm.model_id {
+            // Bundled-model SWITCH (t_10daf382 "Can I AI?" opt-in 9B choice):
+            // the new model is an explicit human pick, so kicking its
+            // sha256-pinned download here is honoring that choice — the old
+            // model's file + record stay on disk (per-model state), and the
+            // reap above guarantees the sidecar restarts against the new one.
+            start_model_download(&st, sidecar::model_for_id(&now_lm.model_id).unwrap_or(&DEFAULT_MODEL));
         } else if now_auto {
+            let now_spec = sidecar::model_for_id(&now_lm.model_id).unwrap_or(&DEFAULT_MODEL);
             st.set_lane(
-                if sidecar::model_is_ready(&st.data_dir, &DEFAULT_MODEL) {
+                if sidecar::model_is_ready(&st.data_dir, now_spec) {
                     LaneStatus::ModelReady
                 } else if st.download_active.load(Ordering::Relaxed) {
                     LaneStatus::Downloading
@@ -2079,6 +2133,77 @@ mod tests {
         };
         let merged_off = merge_settings(&current, &off);
         assert_eq!(merged_off.validate().unwrap_err().field, "capabilities");
+    }
+
+    #[test]
+    fn merged_model_id_canonicalizes_to_the_pinned_menu() {
+        let base = GuiSettings {
+            coordinator_url: "https://coordinator.test".to_string(),
+            public_key_hex: String::new(),
+            concurrency: 2,
+            dry_run: true,
+            capabilities: Capabilities::default(),
+            schedule: ScheduleCfg::default(),
+            local_model: settings::LocalModelCfg::default(),
+        };
+        let input_for = |model_id: &str| SettingsInput {
+            coordinator_url: None,
+            public_key_hex: None,
+            concurrency: None,
+            dry_run: None,
+            capabilities: None,
+            schedule: None,
+            local_model: Some(LocalModelIn {
+                mode: Some("auto".to_string()),
+                cap: None,
+                model_id: Some(model_id.to_string()),
+                endpoint: None,
+                llama_server_bin: None,
+                model_name: None,
+                ctx_tokens: None,
+            }),
+            llm_api_key: None,
+        };
+        // The 9B opt-in id survives the merge exactly.
+        let merged = merge_settings(&base, &input_for(sidecar::LARGE_MODEL.id));
+        assert!(merged.validate().is_ok());
+        assert_eq!(merged.local_model.model_id, sidecar::LARGE_MODEL.id);
+        assert_eq!(merged.local_model.mode, LlmMode::Auto);
+        assert!(merged.capabilities.classify, "auto ⇒ classify (unchanged invariant)");
+        // Junk and empty ids can never survive into Auto mode's sidecar path.
+        let junk = merge_settings(&base, &input_for("totally-not-a-model"));
+        assert_eq!(junk.local_model.model_id, sidecar::DEFAULT_MODEL.id);
+        let empty = merge_settings(&base, &input_for("   "));
+        assert_eq!(empty.local_model.model_id, sidecar::DEFAULT_MODEL.id);
+        // Absent field keeps whatever the current settings say.
+        let untouched = merge_settings(
+            &GuiSettings {
+                local_model: settings::LocalModelCfg {
+                    model_id: sidecar::LARGE_MODEL.id.to_string(),
+                    ..settings::LocalModelCfg::default()
+                },
+                ..base.clone()
+            },
+            &SettingsInput {
+                local_model: Some(LocalModelIn {
+                    model_id: None,
+                    mode: Some("auto".to_string()),
+                    cap: None,
+                    endpoint: None,
+                    llama_server_bin: None,
+                    model_name: None,
+                    ctx_tokens: None,
+                }),
+                coordinator_url: None,
+                public_key_hex: None,
+                concurrency: None,
+                dry_run: None,
+                capabilities: None,
+                schedule: None,
+                llm_api_key: None,
+            },
+        );
+        assert_eq!(untouched.local_model.model_id, sidecar::LARGE_MODEL.id);
     }
 
     /// Minimal HTTP coordinator stand-in (no external deps): /health,

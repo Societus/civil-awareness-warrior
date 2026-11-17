@@ -1,7 +1,7 @@
 <script>
 	import { invoke } from '@tauri-apps/api/core';
 	import { CAPABILITIES } from '#lib/capabilities.js';
-	import { scheduleInWindow, LOCAL_MODEL_MODES, LOCAL_MODEL_CAPS, fmtBytes } from '#lib/settings-util.js';
+	import { scheduleInWindow, LOCAL_MODEL_MODES, LOCAL_MODEL_CAPS, LOCAL_MODEL_BUNDLED, LOCAL_MODEL_BUNDLED_DEFAULT_ID, bundledModelCaption, fmtBytes, fmtGiB } from '#lib/settings-util.js';
 	import { demoSaveSettings, demoRegister, demoUnregister } from '#lib/demo.js';
 
 	const inTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
@@ -51,6 +51,7 @@
 			local_model: {
 				mode: v?.local_model?.mode ?? 'none',
 				cap: v?.local_model?.cap ?? 'cpu_third',
+				model_id: v?.local_model?.model_id ?? LOCAL_MODEL_BUNDLED_DEFAULT_ID,
 				endpoint: v?.local_model?.endpoint ?? '',
 				llama_server_bin: v?.local_model?.llama_server_bin ?? '',
 				model_name: v?.local_model?.model_name ?? '',
@@ -229,6 +230,87 @@
 		cpu_half: 'CPU-only (--n-gpu-layers 0), threads capped to half your logical cores (--threads max(1, floor(cores/2))).'
 	});
 	const lmCapHint = $derived(CAP_HINTS[draft.local_model.cap] ?? '');
+
+	// Bundled model menu: SettingsView.bundled_models is the ground truth
+	// (sidecar::bundled_models in Rust); the settings-util mirror only
+	// covers the browser demo, which has no Rust behind it.
+	const bundledModels = $derived(view?.bundled_models ?? LOCAL_MODEL_BUNDLED);
+
+	// "Can I AI?" hardware advisor (t_10daf382): click-only RAM/VRAM probe +
+	// suggestion matrix. Results render here and nowhere else — the check
+	// never runs at startup or in the background, and it NEVER changes
+	// settings by itself (the tier-2 deep link only preselects the UNSAVED
+	// form draft; saving stays a human act).
+	/** @type {any} */
+	let hwAdvice = $state(null);
+	let hwBusy = $state(false);
+
+	async function runHwCheck() {
+		if (!inTauri) {
+			note = 'Can I AI? reads real hardware — only available in the real app; the browser demo mirrors the UI shape only.';
+			return;
+		}
+		hwBusy = true;
+		hwAdvice = null;
+		note = '';
+		errors = {};
+		try {
+			hwAdvice = await invoke('check_hardware');
+		} catch (e) {
+			hwAdvice = null;
+			errors = toFieldErrors(e);
+		} finally {
+			hwBusy = false;
+		}
+	}
+
+	/** AdviceLine → render parts: AdviceLink splices inline at the
+	 *  {{link}} marker (mirrors hardware.rs INLINE_LINK_MARKER); otherwise
+	 *  the anchor is appended after the sentence.
+	 *  @param {any} line @returns {Array<{ t?: string, a?: any }>} */
+	function lineParts(line) {
+		const marker = '{{link}}';
+		const text = String(line.text ?? '');
+		if (line.link && text.includes(marker)) {
+			/** @type {Array<{ t?: string, a?: any }>} */
+			const out = [];
+			const chunks = text.split(marker);
+			chunks.forEach((chunk, i) => {
+				if (chunk) out.push({ t: chunk });
+				if (i < chunks.length - 1) out.push({ a: line.link });
+			});
+			return out;
+		}
+		/** @type {Array<{ t?: string, a?: any }>} */
+		const out = [{ t: text }];
+		if (line.link) out.push({ a: line.link });
+		return out;
+	}
+
+	/** Open an advisor link in the SYSTEM browser via the opener plugin
+	 *  (capability-scoped to huggingface.co only). The anchor href stays
+	 *  real for the demo and as a copyable fallback; if the plugin rejects,
+	 *  the URL is surfaced verbatim for opening by hand.
+	 *  @param {MouseEvent} e @param {string} url */
+	async function openLink(e, url) {
+		if (!inTauri) return; // demo/browser: default anchor behaviour
+		e.preventDefault();
+		try {
+			await invoke('plugin:opener|open_url', { url });
+		} catch {
+			note = `Could not open the link in-app — copy it by hand: ${url}`;
+		}
+	}
+
+	/** Tier-2 deep link: preselect Custom endpoint in the FORM only —
+	 *  nothing saves until Save settings is pressed (advisor doctrine:
+	 *  purely advisory, never changes settings). */
+	function openCustomEndpoint() {
+		draft.local_model.mode = 'custom';
+		note = 'Custom endpoint preselected in the form above — nothing is saved until you press Save settings.';
+		// One tick so the custom form renders, then focus its endpoint input.
+		setTimeout(() => document.getElementById('lm-endpoint-c')?.focus(), 0);
+	}
 
 	const lmStatusText = $derived.by(() => {
 		switch (llm?.status) {
@@ -449,6 +531,22 @@
 
 				{#if lmMode === 'auto'}
 					<div>
+						<label for="lm-model-pick">Bundled model</label>
+						<select id="lm-model-pick" bind:value={draft.local_model.model_id}>
+							{#each bundledModels as m (m.id)}
+								<option value={m.id}>
+									{bundledModelCaption(m.id)}{m.id === LOCAL_MODEL_BUNDLED_DEFAULT_ID ? ' — default' : ''}
+								</option>
+							{/each}
+						</select>
+					</div>
+					<p class="fine">
+						Each entry is its own sha256-pinned download: switching models re-kicks the download of the
+						chosen file (the other model's verified file stays on disk), and a live sidecar restarts
+						against the new pick. The 9B-class file is opt-in — only worth picking if your machine
+						clears the "Can I AI?" check below.
+					</p>
+					<div>
 						<label for="lm-cap">Resource cap</label>
 						<select id="lm-cap" bind:value={draft.local_model.cap}>
 							{#each LOCAL_MODEL_CAPS as c (c.value)}
@@ -460,7 +558,7 @@
 					<div class="identity-box">
 						<div class="meta-row">
 							<span>Model</span>
-							<b>{llm?.model_line ?? 'Qwen2.5 1.5B Instruct · Q4_K_M · 1.1 GB · Apache-2.0'}</b>
+							<b>{llm?.model_line ?? bundledModelCaption(draft.local_model.model_id)}</b>
 						</div>
 						<div class="meta-row">
 							<span>Status</span>
@@ -585,12 +683,69 @@
 						/>
 					</div>
 					<p class="fine">
-						Bundled choice: Qwen/Qwen2.5-1.5B-Instruct-GGUF · Q4_K_M · 1.1 GB · Apache-2.0 — resumable download,
-						pinned sha256 verified after landing, stored under {view?.data_dir ?? 'the app data dir'}/models/.
-						"Free disk" removes it; re-enabling Auto downloads it again.
+						Bundled model selected above: every choice is a resumable download with its pinned sha256
+						verified after landing, with per-model bookkeeping under {view?.data_dir ?? 'the app data dir'}/models/.
+						"Free disk" removes the active model's file; re-enabling Auto downloads it again.
 					</p>
 				</details>
 			{/if}
+
+			<div class="hw-advisor">
+				<div class="hw-advisor-row">
+					<button onclick={runHwCheck} disabled={busy || hwBusy}>{hwBusy ? 'Checking…' : 'Can I AI?'}</button>
+					<span class="fine">
+						Click-only check: reads this machine's RAM and graphics memory locally — nothing is stored,
+						uploaded, or transmitted, and the answer never changes any setting.
+					</span>
+				</div>
+				{#if hwAdvice}
+					<div class="identity-box hw-result">
+						<div class="meta-row"><span>OS</span><b>{hwAdvice.os_label}</b></div>
+						{#if hwAdvice.ram_bytes != null}
+							<div class="meta-row">
+								<span>System RAM</span>
+								<b>{fmtGiB(hwAdvice.ram_bytes)}{hwAdvice.unified_memory ? ' · unified (the GPU shares it)' : ''}</b>
+							</div>
+						{/if}
+						{#if hwAdvice.gpu_state === 'detected'}
+							<div class="meta-row">
+								<span>GPU</span>
+								<b>{fmtGiB(hwAdvice.vram_bytes)} dedicated VRAM · raw ({hwAdvice.gpu_source})</b>
+							</div>
+						{:else if hwAdvice.gpu_state === 'absent'}
+							<div class="meta-row">
+								<span>GPU</span>
+								<b>{hwAdvice.unified_memory ? 'integrated — unified memory, no separate VRAM' : 'no discrete GPU detected'}</b>
+							</div>
+						{:else}
+							<div class="meta-row"><span>GPU</span><b>couldn't determine</b></div>
+						{/if}
+						{#if hwAdvice.usable_vram_estimate != null}
+							<div class="meta-row">
+								<span>VRAM usable est.</span>
+								<b>≈{fmtGiB(hwAdvice.usable_vram_estimate)} — Windows + desktop composition reserve part of the raw {fmtGiB(hwAdvice.vram_bytes)}</b>
+							</div>
+						{/if}
+						{#each hwAdvice.lines as line, li (li)}
+							<p class="fine hw-line">
+								{#each lineParts(line) as part, pi (pi)}
+									{#if part.a}
+										<a class="hw-link" href={part.a.url} title={part.a.url} target="_blank" rel="noopener noreferrer" onclick={(/** @type {MouseEvent} */ e) => openLink(e, part.a.url)}>{part.a.label}</a>
+									{:else}
+										{part.t}
+									{/if}
+								{/each}
+							</p>
+						{/each}
+						{#if hwAdvice.offer_custom_endpoint}
+							<div class="settings-actions">
+								<button onclick={openCustomEndpoint} disabled={busy}>Open Custom endpoint settings</button>
+							</div>
+							<p class="fine">This button only preselects the Custom endpoint form above — nothing is saved until you press Save settings.</p>
+						{/if}
+					</div>
+				{/if}
+			</div>
 		</section>
 
 		<div class="settings-actions">

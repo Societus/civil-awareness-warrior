@@ -231,6 +231,14 @@ pub struct LocalModelCfg {
     pub mode: LlmMode,
     #[serde(default)]
     pub cap: ResourceCap,
+    /// Auto mode: which bundled model file the sidecar steers — a
+    /// sidecar::bundled_models id. "" normalizes to the pinned default
+    /// (normalize_local_model); the default stays the small 2B-class file
+    /// and the 9B choice (t_10daf382 "Can I AI?" tier-1 suggestion) is
+    /// strictly opt-in. Unknown ids never survive normalization — the
+    /// sidecar can only ever be pointed at a pinned ModelSpec.
+    #[serde(default)]
+    pub model_id: String,
     /// "" = default sidecar endpoint (http://127.0.0.1:8081/v1). In Auto
     /// mode this may only retarget the sidecar to another loopback port.
     #[serde(default)]
@@ -264,6 +272,7 @@ impl Default for LocalModelCfg {
         LocalModelCfg {
             mode: LlmMode::None,
             cap: ResourceCap::CpuThird,
+            model_id: String::new(),
             endpoint: String::new(),
             llama_server_bin: String::new(),
             model_name: String::new(),
@@ -363,6 +372,7 @@ impl GuiSettings {
             Some(base) => LocalModelCfg {
                 mode: LlmMode::Custom,
                 cap: ResourceCap::CpuThird,
+                model_id: String::new(),
                 endpoint: crate::sidecar::ensure_v1(&base),
                 llama_server_bin: String::new(),
                 model_name: std::env::var("LH_LLM_MODEL")
@@ -406,6 +416,13 @@ impl GuiSettings {
     /// settings.json is normalized on load rather than rejected.)
     pub fn normalize_local_model(&mut self) {
         self.capabilities.classify = !matches!(self.local_model.mode, LlmMode::None);
+        // The bundled model id canonicalizes against the sidecar's pinned
+        // menu: empty or unknown lands on the pinned default, so a
+        // hand-edited settings.json can never steer the sidecar toward an
+        // unpinned model (sidecar::model_for_id is the only resolver).
+        self.local_model.model_id = crate::sidecar::model_for_id(&self.local_model.model_id)
+            .map(|spec| spec.id.to_string())
+            .unwrap_or_else(|| crate::sidecar::DEFAULT_MODEL.id.to_string());
         let trimmed = self.local_model.endpoint.trim().to_string();
         self.local_model.endpoint = if trimmed.is_empty() {
             String::new()
@@ -698,6 +715,7 @@ mod tests {
             local_model: LocalModelCfg {
                 mode: LlmMode::Custom,
                 cap: ResourceCap::CpuHalf,
+                model_id: crate::sidecar::LARGE_MODEL.id.to_string(),
                 endpoint: "http://127.0.0.1:1234/v1".to_string(),
                 llama_server_bin: String::new(),
                 model_name: "qwen3:8b".to_string(),
@@ -715,6 +733,11 @@ mod tests {
         assert_eq!(loaded.concurrency, 5);
         assert_eq!(loaded.local_model.mode, LlmMode::Custom);
         assert_eq!(loaded.local_model.cap, ResourceCap::CpuHalf);
+        assert_eq!(
+            loaded.local_model.model_id,
+            crate::sidecar::LARGE_MODEL.id,
+            "a legitimate bundled id round-trips untouched"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -940,6 +963,7 @@ mod tests {
         junk.local_model = LocalModelCfg {
             mode: LlmMode::Custom,
             cap: ResourceCap::CpuThird,
+            model_id: String::new(),
             endpoint: "127.0.0.1:1234/v1".to_string(),
             llama_server_bin: String::new(),
             model_name: String::new(),
@@ -953,6 +977,7 @@ mod tests {
         auto_external.local_model = LocalModelCfg {
             mode: LlmMode::Auto,
             cap: ResourceCap::CpuThird,
+            model_id: String::new(),
             endpoint: "https://api.some-provider.example/v1".to_string(),
             llama_server_bin: String::new(),
             model_name: String::new(),
@@ -967,6 +992,7 @@ mod tests {
         auto_loopback.local_model = LocalModelCfg {
             mode: LlmMode::Auto,
             cap: ResourceCap::Gpu,
+            model_id: String::new(),
             endpoint: "http://127.0.0.1:8090/v1".to_string(),
             llama_server_bin: String::new(),
             model_name: String::new(),
@@ -986,5 +1012,67 @@ mod tests {
         drift.capabilities.classify = true;
         let err = drift.validate().unwrap_err();
         assert_eq!(err.field, "capabilities");
+    }
+
+    #[test]
+    fn bundled_model_id_normalizes_to_the_pinned_menu_at_load_and_save() {
+        let dir = std::env::temp_dir().join("lhc-settings-model-id-test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // Hand-edited junk id must not survive into the sidecar path.
+        fs::write(
+            dir.join("settings.json"),
+            r#"{
+  "coordinator_url": "http://coordinator.test",
+  "public_key_hex": "",
+  "concurrency": 2,
+  "dry_run": true,
+  "capabilities": { "examination": true, "ingest": true, "alt_source": false, "state_walk": false, "search": false, "classify": true },
+  "schedule": { "enabled": false, "active_from": "06:00", "active_until": "22:00" },
+  "local_model": { "mode": "auto", "model_id": "totally-not-a-model" }
+}"#,
+        )
+        .unwrap();
+        let loaded = load_or_create(&dir).expect("load");
+        assert_eq!(loaded.local_model.model_id, crate::sidecar::DEFAULT_MODEL.id);
+        assert!(loaded.capabilities.classify);
+
+        // The opt-in 9B choice survives normalize + write + reload.
+        let mut chosen = loaded.clone();
+        chosen.local_model.model_id = crate::sidecar::LARGE_MODEL.id.to_string();
+        chosen.normalize_local_model();
+        assert_eq!(chosen.local_model.model_id, crate::sidecar::LARGE_MODEL.id);
+        write(&dir, &chosen).expect("write");
+        let reloaded = load_or_create(&dir).expect("reload");
+        assert_eq!(reloaded.local_model.model_id, crate::sidecar::LARGE_MODEL.id);
+
+        // A legacy settings.json without the field at all gets the pinned
+        // default (serde default → canonicalize), never an empty steer.
+        let legacy_dir = std::env::temp_dir().join("lhc-settings-model-id-legacy");
+        let _ = fs::remove_dir_all(&legacy_dir);
+        fs::create_dir_all(&legacy_dir).unwrap();
+        fs::write(
+            legacy_dir.join("settings.json"),
+            r#"{
+  "coordinator_url": "http://coordinator.test",
+  "public_key_hex": "",
+  "concurrency": 2,
+  "dry_run": true,
+  "capabilities": { "examination": true, "ingest": true, "alt_source": false, "state_walk": false, "search": false, "classify": false },
+  "schedule": { "enabled": false, "active_from": "06:00", "active_until": "22:00" },
+  "local_model": { "mode": "custom", "endpoint": "http://127.0.0.1:1234/v1" }
+}"#,
+        )
+        .unwrap();
+        let legacy = load_or_create(&legacy_dir).expect("legacy load");
+        assert_eq!(
+            legacy.local_model.model_id,
+            crate::sidecar::DEFAULT_MODEL.id,
+            "missing field is serde-defaulted then canonicalized"
+        );
+        assert_eq!(legacy.local_model.mode, LlmMode::Custom);
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&legacy_dir);
     }
 }

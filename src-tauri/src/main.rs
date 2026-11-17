@@ -3,6 +3,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod contributor;
+mod hardware;
 mod settings;
 mod sidecar;
 
@@ -14,6 +15,10 @@ use tauri::{Emitter, Manager, WindowEvent};
 
 fn main() {
     tauri::Builder::default()
+        // "Can I AI?" advisor links open in the system browser through the
+        // opener plugin; the capability scopes it to huggingface.co only
+        // (capabilities/default.json). No other URL can be opened.
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let handle = app.handle().clone();
 
@@ -107,6 +112,7 @@ fn main() {
             contributor::download_local_model,
             contributor::delete_local_model,
             contributor::check_local_model,
+            hardware::check_hardware,
             contributor::quit_app
         ])
         .build(tauri::generate_context!())

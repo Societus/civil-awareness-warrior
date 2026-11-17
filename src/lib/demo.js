@@ -135,6 +135,7 @@ export function demoSaveSettings(input) {
 		if (i.endpoint != null) lm.endpoint = String(i.endpoint).trim();
 		if (i.llama_server_bin != null) lm.llama_server_bin = String(i.llama_server_bin).trim();
 		if (i.model_name != null) lm.model_name = String(i.model_name).trim();
+		if (i.model_id != null) lm.model_id = String(i.model_id).trim();
 		if (i.ctx_tokens != null) lm.ctx_tokens = Number(i.ctx_tokens);
 	}
 	// Same normalize the Rust save path runs (classify follows the mode).

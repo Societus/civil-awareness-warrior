@@ -105,9 +105,34 @@ export const LOCAL_MODEL_CAPS = [
 	{ value: 'cpu_half', label: 'CPU ≤½ cores' }
 ];
 
+// The Auto-configure bundled model menu — mirror of sidecar::bundled_models
+// (src-tauri/src/sidecar.rs); index 0 is the pinned default, the 9B choice
+// is opt-in. The real dialog renders SettingsView.bundled_models (Rust is
+// the ground truth); this mirror only keeps the browser demo in shape.
+const BUNDLED_DEFAULT_MODEL = { id: 'qwen2.5-1.5b-instruct-q4_k_m', label: 'Qwen2.5 1.5B Instruct', quant: 'Q4_K_M', bytes: 1117320736, license: 'Apache-2.0' };
+const BUNDLED_LARGE_MODEL = { id: 'ornith-1.5-9b-q4_k_m', label: 'Ornith-1.5-9B', quant: 'Q4_K_M', bytes: 5780090816, license: 'MIT' };
+export const LOCAL_MODEL_BUNDLED = [BUNDLED_DEFAULT_MODEL, BUNDLED_LARGE_MODEL];
+export const LOCAL_MODEL_BUNDLED_DEFAULT_ID = BUNDLED_DEFAULT_MODEL.id;
+
+/** Mirror of sidecar::model_for_id + normalize_local_model canonicalization:
+ * unknown ids never resolve — they land on the pinned default.
+ * @param {unknown} id @returns {string} canonical bundled id */
+export function bundledModelId(id) {
+	const found = LOCAL_MODEL_BUNDLED.find((m) => m.id === String(id ?? '').trim());
+	return found ? found.id : BUNDLED_DEFAULT_MODEL.id;
+}
+
+/** Caption mirror of sidecar::model_caption ("Ornith-1.5-9B · Q4_K_M · 5.8 GB · MIT").
+ * @param {unknown} id @returns {string} */
+export function bundledModelCaption(id) {
+	const m = LOCAL_MODEL_BUNDLED.find((b) => b.id === bundledModelId(id)) ?? BUNDLED_DEFAULT_MODEL;
+	return `${m.label} · ${m.quant} · ${(m.bytes / 1e9).toFixed(1)} GB · ${m.license}`;
+}
+
 export const LOCAL_MODEL_DEFAULT = {
 	mode: 'none',
 	cap: 'cpu_third',
+	model_id: BUNDLED_DEFAULT_MODEL.id,
 	endpoint: '',
 	llama_server_bin: '',
 	model_name: '',
@@ -150,6 +175,7 @@ export function ensureV1(url) {
  * @param {any} merged @returns {any} */
 export function normalizeLocalModel(merged) {
 	merged.capabilities.classify = (merged.local_model?.mode ?? 'none') !== 'none';
+	merged.local_model.model_id = bundledModelId(merged.local_model.model_id);
 	const e = String(merged.local_model?.endpoint ?? '').trim();
 	merged.local_model.endpoint = e === '' ? '' : ensureV1(e);
 	return merged;
@@ -208,7 +234,12 @@ export function demoLlmView(s) {
 		status: lm.mode === 'none' ? 'off' : lm.mode === 'auto' ? 'model_missing' : 'off',
 		detail: null,
 		progress: null,
-		model_line: null,
+		model_line:
+			lm.mode === 'auto'
+				? bundledModelCaption(lm.model_id)
+				: lm.mode === 'custom'
+					? (String(lm.model_name ?? '').trim() || (lm.endpoint === '' ? LLM_DEFAULT_ENDPOINT : lm.endpoint))
+					: null,
 		model_bytes_on_disk: lm.mode === 'auto' ? 0 : null,
 		cap: lm.cap,
 		ctx_tokens: lm.ctx_tokens,
@@ -229,4 +260,13 @@ export function fmtBytes(n) {
 	if (n >= 1073741824) return `${(n / 1073741824).toFixed(2)} GB`;
 	if (n >= 1048576) return `${Math.round(n / 1048576)} MB`;
 	return `${n} B`;
+}
+
+/** GiB with 1 decimal — the "Can I AI?" advisor shows RAM/VRAM in binary
+ * units because its thresholds are GiB-based (a marketed "10 GB" card is
+ * exactly 10 GiB, so the boundary is honest).
+ * @param {number|null|undefined} n @returns {string} */
+export function fmtGiB(n) {
+	if (n == null) return '';
+	return `${(n / 1073741824).toFixed(1)} GiB`;
 }

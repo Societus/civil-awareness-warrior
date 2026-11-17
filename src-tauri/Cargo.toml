@@ -29,3 +29,16 @@ url = "2"
 sha2 = "0.10"
 futures-util = "0.3"
 libc = "0.2"
+# "Can I AI?" advisor links (t_10daf382): the hardware report carries the
+# operator-designated HF repo link; the opener plugin launches it in the
+# SYSTEM browser, and capabilities/default.json scopes that permission to
+# huggingface.co only. (Tauri 2 core has no link-opening command.)
+tauri-plugin-opener = "2"
+
+[target.'cfg(windows)'.dependencies]
+# "Can I AI?" Windows probe half: DXGI DedicatedVideoMemory + GlobalMemoryStatusEx.
+# Same windows version tauri already pins in Cargo.lock (0.62.2) — cargo
+# unifies to one compiled crate; the features only gate what THIS crate's
+# windows code may name. Deliberately NOT Win32_Media_Audio / UI halves, and
+# never Win32_Graphics_Dxgi_Constants beyond what EnumAdapters/GetDesc1 need.
+windows = { version = "0.62", features = ["Win32_Graphics_Dxgi", "Win32_System_SystemInformation"] }
