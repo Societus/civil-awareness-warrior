@@ -1,7 +1,7 @@
 <script>
 	import { invoke } from '@tauri-apps/api/core';
 	import { CAPABILITIES } from '#lib/capabilities.js';
-	import { scheduleInWindow } from '#lib/settings-util.js';
+	import { scheduleInWindow, LOCAL_MODEL_MODES, LOCAL_MODEL_CAPS, fmtBytes } from '#lib/settings-util.js';
 	import { demoSaveSettings, demoRegister, demoUnregister } from '#lib/demo.js';
 
 	const inTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
@@ -47,7 +47,19 @@
 				enabled: sc.enabled ?? false,
 				active_from: sc.active_from ?? '09:00',
 				active_until: sc.active_until ?? '17:00'
-			}
+			},
+			local_model: {
+				mode: v?.local_model?.mode ?? 'none',
+				cap: v?.local_model?.cap ?? 'cpu_third',
+				endpoint: v?.local_model?.endpoint ?? '',
+				llama_server_bin: v?.local_model?.llama_server_bin ?? '',
+				model_name: v?.local_model?.model_name ?? '',
+				ctx_tokens: v?.local_model?.ctx_tokens ?? 4096
+			},
+			// API keys never round-trip through any settings view; this field is
+			// for ENTERING a new key only (the backend stores it out-of-band in
+			// llm_api_key.json and never echoes it back).
+			llm_api_key: ''
 		};
 	}
 
@@ -116,7 +128,12 @@
 				enabled: draft.schedule.enabled,
 				active_from: draft.schedule.active_from,
 				active_until: draft.schedule.active_until
-			}
+			},
+			local_model: { ...draft.local_model },
+			// Key handling: sent ONLY when a new key was typed (replace) or
+			// Remove key was pressed ('' → backend deletes the stored file).
+			// Untouched saves omit it entirely.
+			llm_api_key: removeLlmKey ? '' : draft.llm_api_key.trim() === '' ? undefined : draft.llm_api_key.trim()
 		};
 		try {
 			const next = inTauri ? await invoke('save_settings', { input }) : demoSaveSettings(input);
@@ -127,9 +144,12 @@
 				concurrency: next.concurrency,
 				dry_run: next.dry_run,
 				capabilities: { ...next.capabilities },
-				schedule: { ...next.schedule }
+				schedule: { ...next.schedule },
+				local_model: { ...next.local_model },
+				llm_api_key: ''
 			};
-			note = 'Settings saved. Concurrency, capabilities and dry-run apply on the next start; the run window is enforced live.';
+			removeLlmKey = false;
+			note = 'Settings saved. Concurrency, capabilities and dry-run apply on the next start; the run window and the local-model lane are reconciled immediately (a live sidecar restarts with the new caps when needed).';
 			await onChanged?.();
 		} catch (e) {
 			errors = toFieldErrors(e);
@@ -194,6 +214,65 @@
 	}
 
 	const windowNow = $derived(scheduleInWindow(draft.schedule, new Date(nowMs)));
+
+	// Local model (t_3067589d). `llm` is the LIVE lane view: the parent
+	// polls get_status/get_settings_view every 2 s, so model status and
+	// download progress refresh here while the dialog stays open. The draft
+	// (what the user is about to save) drives which controls show.
+	const llm = $derived(status?.llm ?? view?.llm ?? null);
+	const lmMode = $derived(draft.local_model.mode);
+	let removeLlmKey = $state(false);
+
+	const CAP_HINTS = /** @type {Record<string, string>} */ ({
+		gpu: 'Offload every layer the GPU can take (--n-gpu-layers 999). No GPU? llama-server falls back to CPU — this cap never hard-fails.',
+		cpu_third: 'CPU-only (--n-gpu-layers 0), threads capped to a third of your logical cores (--threads max(1, floor(cores/3))).',
+		cpu_half: 'CPU-only (--n-gpu-layers 0), threads capped to half your logical cores (--threads max(1, floor(cores/2))).'
+	});
+	const lmCapHint = $derived(CAP_HINTS[draft.local_model.cap] ?? '');
+
+	const lmStatusText = $derived.by(() => {
+		switch (llm?.status) {
+			case 'model_missing':
+				return 'not downloaded';
+			case 'downloading':
+				return `downloading… ${llm?.progress?.percent ?? 0}%`;
+			case 'model_error':
+				return 'download failed';
+			case 'model_ready':
+				return 'ready on disk — Start boots the sidecar';
+			case 'binary_missing':
+				return 'model ready — llama-server not found (install llama.cpp, set its path below, or switch to Custom endpoint)';
+			case 'starting':
+				return 'starting sidecar…';
+			case 'ready':
+				return `ready — ${llm?.model_line ?? 'local model'} · ctx ${draft.local_model.ctx_tokens}${llm?.reused_external_server ? ' — reusing your own server at that endpoint (the app never kills it)' : ''}`;
+			case 'unhealthy':
+				return 'not answering — Start will refuse until fixed';
+			case 'off':
+				return 'off';
+			default:
+				return '—';
+		}
+	});
+
+	/** download / check / free-disk backend commands (real app only). */
+	async function lmAction(/** @type {string} */ cmd, /** @type {string} */ label) {
+		if (!inTauri) {
+			note = `${label} is only available in the real app — the browser demo mirrors the UI shape only.`;
+			return;
+		}
+		busy = true;
+		note = '';
+		errors = {};
+		try {
+			note = String(await invoke(cmd));
+			await onChanged?.();
+		} catch (e) {
+			errors = toFieldErrors(e);
+		} finally {
+			busy = false;
+		}
+	}
 </script>
 
 <div class="settings-overlay">
@@ -228,6 +307,10 @@
 					</label>
 				{/each}
 			</div>
+			<p class="fine">
+				Search-grading (classify) is not a manual toggle — it unlocks automatically when a local model below is
+				configured and its endpoint is healthy.
+			</p>
 		</section>
 
 		<section class="settings-section" aria-labelledby="conc-title">
@@ -338,12 +421,176 @@
 			</p>
 		</section>
 
-		<section class="settings-section" aria-labelledby="adv-title">
-			<h3 class="section-label" id="adv-title">Advanced</h3>
-			<div class="advanced-placeholder">
-				Future options — local model opt-in, resource caps (GPU / ⅓-cores), model status — will appear here when
-				LLM chunks ship.
+		<section class="settings-section" aria-labelledby="lm-title">
+			<h3 class="section-label" id="lm-title">Local model</h3>
+			<div>
+				<label for="lm-mode">Local model</label>
+				<select id="lm-mode" bind:value={draft.local_model.mode}>
+					{#each LOCAL_MODEL_MODES as m (m.value)}
+						<option value={m.value}>{m.label}</option>
+					{/each}
+				</select>
 			</div>
+			{#if errors.local_model}
+				<p class="field-error" role="alert">{errors.local_model}</p>
+			{/if}
+
+			{#if lmMode === 'none'}
+				<p class="fine">
+					Some search-grading jobs are unavailable without a local model. Every other job type works normally —
+					this is not an error.
+				</p>
+			{:else}
+				<p class="fine">
+					{lmMode === 'auto'
+						? 'Runs a small local model on this machine to grade search results — nothing is uploaded except the verdict JSON.'
+						: 'Grades search results through an OpenAI-compatible endpoint you run or subscribe to. The verdict JSON schema is identical to Auto-configure.'}
+				</p>
+
+				{#if lmMode === 'auto'}
+					<div>
+						<label for="lm-cap">Resource cap</label>
+						<select id="lm-cap" bind:value={draft.local_model.cap}>
+							{#each LOCAL_MODEL_CAPS as c (c.value)}
+								<option value={c.value}>{c.label}</option>
+							{/each}
+						</select>
+					</div>
+					<p class="fine">{lmCapHint}</p>
+					<div class="identity-box">
+						<div class="meta-row">
+							<span>Model</span>
+							<b>{llm?.model_line ?? 'Qwen2.5 1.5B Instruct · Q4_K_M · 1.1 GB · Apache-2.0'}</b>
+						</div>
+						<div class="meta-row">
+							<span>Status</span>
+							<b>{lmStatusText}</b>
+						</div>
+						{#if llm?.model_bytes_on_disk}
+							<div class="meta-row">
+								<span>on disk</span>
+								<b>{fmtBytes(llm.model_bytes_on_disk)}</b>
+							</div>
+						{/if}
+					</div>
+					{#if llm?.progress}
+						<div class="meta-row lm-progress">
+							<span>download</span>
+							<b>
+								<progress max={llm.progress.total_bytes || 1} value={llm.progress.done_bytes}></progress>
+								{llm.progress.percent}%
+							</b>
+						</div>
+					{/if}
+					{#if llm?.detail}
+						<p class="fine lm-detail">{llm.detail}</p>
+					{/if}
+					<div class="settings-actions">
+						<button onclick={() => lmAction('download_local_model', 'Model download')} disabled={busy}>Download model</button>
+						<button onclick={() => lmAction('check_local_model', 'Endpoint check')} disabled={busy}>Check now</button>
+						<button class="danger" onclick={() => lmAction('delete_local_model', 'Free disk')} disabled={busy}>Free disk</button>
+					</div>
+					<div>
+						<label for="lm-endpoint">Endpoint override (optional)</label>
+						<input
+							id="lm-endpoint"
+							type="text"
+							bind:value={draft.local_model.endpoint}
+							placeholder="default http://127.0.0.1:8081/v1 — set only if your own llama-server already listens there"
+							autocomplete="off"
+						/>
+					</div>
+				{:else}
+					<div>
+						<label for="lm-endpoint-c">Endpoint URL</label>
+						<input
+							id="lm-endpoint-c"
+							type="text"
+							bind:value={draft.local_model.endpoint}
+							placeholder="http://127.0.0.1:1234/v1 (LM Studio) · http://192.168.1.20:8081/v1 (LAN) · or a provider https URL"
+							autocomplete="off"
+						/>
+					</div>
+					<div>
+						<label for="lm-model">Model name</label>
+						<input
+							id="lm-model"
+							type="text"
+							bind:value={draft.local_model.model_name}
+							placeholder="slug sent to the endpoint (llama-server ignores it; cloud providers need the exact name)"
+							autocomplete="off"
+						/>
+					</div>
+					<div>
+						<label for="lm-key">API key (only if your endpoint requires one)</label>
+						<input
+							id="lm-key"
+							type="password"
+							bind:value={draft.llm_api_key}
+							placeholder={llm?.api_key_present ? 'stored — type to replace, or press Remove key' : 'only ever sent to the endpoint above'}
+							autocomplete="off"
+						/>
+						{#if removeLlmKey}
+							<p class="fine lm-detail">The stored key will be deleted when you save.</p>
+						{:else if llm?.api_key_present}
+							<button class="danger" onclick={() => (removeLlmKey = true)} disabled={busy}>Remove key</button>
+						{/if}
+						{#if errors.llm_api_key}
+							<p class="field-error" role="alert">{errors.llm_api_key}</p>
+						{/if}
+					</div>
+					<p class="fine">
+						The key lives in its own 0600 file (same protection class as credentials.json) — never displayed,
+						never logged, and sent only to the endpoint above.
+					</p>
+					{#if llm?.endpoint_is_cloud}
+						<p class="banner" role="note">
+							Cloud endpoint selected: search result snippets transit this third-party provider for grading —
+							only the chunk input and the verdict JSON are exchanged.
+						</p>
+					{/if}
+					<div class="identity-box">
+						<div class="meta-row">
+							<span>Status</span>
+							<b>{llm?.status === 'ready'
+								? 'healthy — Start/Register will advertise search grading'
+								: llm?.status === 'unhealthy'
+									? 'not answering — Start will refuse until fixed'
+									: 'not probed since the last save'}</b>
+						</div>
+					</div>
+					{#if llm?.detail}
+						<p class="fine lm-detail">{llm.detail}</p>
+					{/if}
+					<button onclick={() => lmAction('check_local_model', 'Endpoint check')} disabled={busy}>Check now</button>
+				{/if}
+
+				<div>
+					<label for="lm-ctx">Context tokens (1024–32768)</label>
+					<input id="lm-ctx" type="number" min="1024" max="32768" step="512" bind:value={draft.local_model.ctx_tokens} />
+				</div>
+			{/if}
+
+			{#if lmMode === 'auto'}
+				<details>
+					<summary>Advanced (sidecar binary)</summary>
+					<div>
+						<label for="lm-bin">llama-server binary path</label>
+						<input
+							id="lm-bin"
+							type="text"
+							bind:value={draft.local_model.llama_server_bin}
+							placeholder="empty = search PATH (llama.cpp install)"
+							autocomplete="off"
+						/>
+					</div>
+					<p class="fine">
+						Bundled choice: Qwen/Qwen2.5-1.5B-Instruct-GGUF · Q4_K_M · 1.1 GB · Apache-2.0 — resumable download,
+						pinned sha256 verified after landing, stored under {view?.data_dir ?? 'the app data dir'}/models/.
+						"Free disk" removes it; re-enabling Auto downloads it again.
+					</p>
+				</details>
+			{/if}
 		</section>
 
 		<div class="settings-actions">

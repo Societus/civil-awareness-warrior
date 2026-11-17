@@ -79,7 +79,154 @@ export function validateSettings(merged) {
 			);
 		}
 	}
+	const lmErr = validateLocalModel(merged);
+	if (lmErr) return lmErr;
 	return null;
 }
 
 const CAP_KEYS = ['examination', 'ingest', 'alt_source', 'state_walk', 'search'];
+
+// ---------------------------------------------------------------------------
+// Local Model (t_3067589d) — mirrors LocalModelCfg / LlmMode / ResourceCap /
+// validate() / normalize_local_model() in src-tauri/src/settings.rs, and the
+// LlmView shape from contributor.rs, so the browser demo exercises the same
+// shapes and failures as the Rust side.
+// ---------------------------------------------------------------------------
+
+export const LOCAL_MODEL_MODES = [
+	{ value: 'none', label: 'None — no local model (default)' },
+	{ value: 'auto', label: 'Auto-configure — bundled model + llama-server sidecar' },
+	{ value: 'custom', label: 'Custom endpoint — OpenAI-compatible server you run' }
+];
+
+export const LOCAL_MODEL_CAPS = [
+	{ value: 'gpu', label: 'GPU (if available)' },
+	{ value: 'cpu_third', label: 'CPU ≤⅓ cores' },
+	{ value: 'cpu_half', label: 'CPU ≤½ cores' }
+];
+
+export const LOCAL_MODEL_DEFAULT = {
+	mode: 'none',
+	cap: 'cpu_third',
+	endpoint: '',
+	llama_server_bin: '',
+	model_name: '',
+	ctx_tokens: 4096
+};
+
+export const LLM_DEFAULT_ENDPOINT = 'http://127.0.0.1:8081/v1';
+
+/** Mirror of sidecar::is_loopback_url — loopback + private LAN ranges.
+ * @param {string} url @returns {boolean} */
+export function isLocalEndpoint(url) {
+	let host;
+	try {
+		host = new URL(url).hostname.toLowerCase();
+	} catch {
+		return false;
+	}
+	if (host === 'localhost' || host.endsWith('.local')) return true;
+	if (host === '::1' || host.startsWith('fe80') || host.startsWith('fc') || host.startsWith('fd')) return true;
+	const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.\d{1,3}$/.exec(host);
+	if (!m) return false;
+	const a = Number(m[1]);
+	const b = Number(m[2]);
+	return a === 127 || a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+}
+
+/** Mirror of sidecar::ensure_v1. @param {string} url @returns {string} */
+export function ensureV1(url) {
+	const trimmed = String(url).trim().replace(/\/+$/, '');
+	try {
+		const path = new URL(trimmed).pathname;
+		if (path === '' || path === '/') return `${trimmed}/v1`;
+	} catch {
+		/* leave unparsable strings alone; validation flags them */
+	}
+	return trimmed;
+}
+
+/** Mirror of GuiSettings::normalize_local_model (mutates the merged draft).
+ * @param {any} merged @returns {any} */
+export function normalizeLocalModel(merged) {
+	merged.capabilities.classify = (merged.local_model?.mode ?? 'none') !== 'none';
+	const e = String(merged.local_model?.endpoint ?? '').trim();
+	merged.local_model.endpoint = e === '' ? '' : ensureV1(e);
+	return merged;
+}
+
+/** Mirror of validate()'s local_model arm + the classify invariant.
+ * @param {any} merged @returns {{field:string,message:string}|null} */
+export function validateLocalModel(merged) {
+	const err = (/** @type {string} */ field, /** @type {string} */ message) => ({ field, message });
+	const lm = merged.local_model ?? LOCAL_MODEL_DEFAULT;
+	const ctx = Number(lm.ctx_tokens);
+	if (!Number.isInteger(ctx) || ctx < 1024 || ctx > 32768) {
+		return err('local_model', 'context size must be between 1024 and 32768 tokens (default 4096)');
+	}
+	const endpoint = String(lm.endpoint ?? '').trim();
+	if (lm.mode === 'auto') {
+		if (endpoint && !isLocalEndpoint(endpoint)) {
+			return err(
+				'local_model',
+				'auto-configure runs a sidecar on THIS machine — the endpoint override must be a 127.0.0.1/localhost http URL. Pick Custom endpoint to use another server.'
+			);
+		}
+	} else if (lm.mode === 'custom') {
+		if (!endpoint) {
+			return err(
+				'local_model',
+				'custom endpoint mode needs a base URL (e.g. http://127.0.0.1:1234/v1 for LM Studio, or your provider\'s https URL)'
+			);
+		}
+		if (!endpoint.startsWith('http://') && !endpoint.startsWith('https://')) {
+			return err('local_model', 'endpoint must start with http:// or https://');
+		}
+		try {
+			new URL(endpoint);
+		} catch {
+			return err('local_model', 'endpoint is not a valid URL');
+		}
+	}
+	if (Boolean(merged.capabilities?.classify) !== (lm.mode !== 'none')) {
+		return err(
+			'capabilities',
+			'the search-grading (classify) capability follows the Local Model setting — pick a model mode or switch the model off'
+		);
+	}
+	return null;
+}
+
+/** LlmView-shaped demo lane derived from persisted demo settings only (the
+ * browser demo has no sidecar and no downloads — statuses stay honest:
+ * auto never leaves model_missing, custom is never probed).
+ * @param {any} s @returns {any} */
+export function demoLlmView(s) {
+	const lm = { ...LOCAL_MODEL_DEFAULT, ...(s.local_model ?? {}) };
+	return {
+		mode: lm.mode,
+		status: lm.mode === 'none' ? 'off' : lm.mode === 'auto' ? 'model_missing' : 'off',
+		detail: null,
+		progress: null,
+		model_line: null,
+		model_bytes_on_disk: lm.mode === 'auto' ? 0 : null,
+		cap: lm.cap,
+		ctx_tokens: lm.ctx_tokens,
+		endpoint: lm.mode === 'none' ? null : lm.endpoint === '' ? LLM_DEFAULT_ENDPOINT : lm.endpoint,
+		endpoint_is_cloud:
+			lm.mode === 'custom' && lm.endpoint !== '' && !isLocalEndpoint(lm.endpoint),
+		binary_found: lm.mode !== 'auto',
+		api_key_present: false,
+		reused_external_server: false,
+		sidecar_running: false
+	};
+}
+
+/** Byte counts as human sizes (model row / freed-disk messages).
+ * @param {number|null|undefined} n @returns {string} */
+export function fmtBytes(n) {
+	if (n == null) return '';
+	if (n >= 1073741824) return `${(n / 1073741824).toFixed(2)} GB`;
+	if (n >= 1048576) return `${Math.round(n / 1048576)} MB`;
+	return `${n} B`;
+}

@@ -19,7 +19,7 @@
  * this synthetic loop the same way the Rust watcher gates the real one.
  */
 
-import { scheduleInWindow, validateSettings, parseHHMM } from '#lib/settings-util.js';
+import { scheduleInWindow, validateSettings, parseHHMM, LOCAL_MODEL_DEFAULT, normalizeLocalModel, demoLlmView } from '#lib/settings-util.js';
 
 const CYCLE_SECS = 14; // 0–1 verifying, 2–9 executing, 10–12 submitting, 13 gap
 const SETTINGS_STORAGE_KEY = 'lh-gui-de…s-v1';
@@ -64,7 +64,8 @@ function defaultSettings() {
 		concurrency: 2,
 		dry_run: true,
 		capabilities: { examination: true, ingest: true, alt_source: true, state_walk: true, search: true },
-		schedule: { enabled: false, active_from: '09:00', active_until: '17:00' }
+		schedule: { enabled: false, active_from: '09:00', active_until: '17:00' },
+		local_model: { ...LOCAL_MODEL_DEFAULT }
 	};
 }
 
@@ -78,7 +79,8 @@ function loadSettings() {
 			...base,
 			...stored,
 			capabilities: { ...base.capabilities, ...(stored.capabilities ?? {}) },
-			schedule: { ...base.schedule, ...(stored.schedule ?? {}) }
+			schedule: { ...base.schedule, ...(stored.schedule ?? {}) },
+			local_model: { ...base.local_model, ...(stored.local_model ?? {}) }
 		};
 	} catch {
 		return base;
@@ -125,6 +127,18 @@ export function demoSaveSettings(input) {
 		if (input.schedule.active_until != null)
 			merged.schedule.active_until = String(input.schedule.active_until).trim();
 	}
+	if (input?.local_model) {
+		const lm = merged.local_model;
+		const i = input.local_model;
+		if (i.mode != null && ['none', 'auto', 'custom'].includes(i.mode)) lm.mode = i.mode;
+		if (i.cap != null && ['gpu', 'cpu_third', 'cpu_half'].includes(i.cap)) lm.cap = i.cap;
+		if (i.endpoint != null) lm.endpoint = String(i.endpoint).trim();
+		if (i.llama_server_bin != null) lm.llama_server_bin = String(i.llama_server_bin).trim();
+		if (i.model_name != null) lm.model_name = String(i.model_name).trim();
+		if (i.ctx_tokens != null) lm.ctx_tokens = Number(i.ctx_tokens);
+	}
+	// Same normalize the Rust save path runs (classify follows the mode).
+	normalizeLocalModel(merged);
 	const bad = validateSettings(merged);
 	if (bad) throw bad;
 	saveSettingsToStorage(merged);
@@ -148,7 +162,9 @@ function settingsView(s) {
 		data_dir: '/demo/app-data',
 		credentials_path: '/demo/app-data/credentials.json',
 		credentials_present: creds != null,
-		client_id: creds?.client_id ?? null
+		client_id: creds?.client_id ?? null,
+		local_model: s.local_model,
+		llm: demoLlmView(s)
 	};
 }
 
@@ -312,7 +328,10 @@ export function makeDemoStatus(tickSecs) {
 		},
 		slots,
 		client_version: '0.1.0 (demo)',
-		gui_version: '0.1.0'
+		gui_version: '0.1.0',
+		// LlmView-shaped live lane mirror (the browser demo never downloads
+		// or spawns anything — statuses stay honest per settings-util).
+		llm: demoLlmView(settings)
 	};
 }
 

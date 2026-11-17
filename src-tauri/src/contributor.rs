@@ -34,6 +34,17 @@
 //! the public `GET /v1/chunk/:id/contract` endpoint and caches it. When a
 //! lookup fails the UI degrades to the chunk id.
 //!
+//! Local Model lane (t_3067589d): `ensure_llm_ready` runs on every Start/
+//! Resume/Register. Auto mode ensures the verified model file + a healthy
+//! llama-server sidecar (spawning it if needed, with a hard health budget);
+//! Custom mode probes the volunteer's endpoint. The SDK `Config.llm` is set
+//! ONLY when enabled AND healthy — so the register call declares the llm
+//! capability exactly when the classify lane can actually execute, and
+//! `llm: None` (mode None) keeps the app byte-identical to its pre-change
+//! behavior. Pause/quit stop the sidecar (SIGTERM→SIGKILL, always reaped);
+//! a safety monitor relaunches a crashed sidecar while the loop runs (with
+//! a respawn budget) and kills any child left behind when the loop isn't.
+//!
 //! `AppState` lives behind an `Arc` so the lifecycle logic can be exercised
 //! in tests with `app: None` (no Tauri runtime, no tray) against a
 //! fake-coordinator test harness — the exact `begin_run`/`pause_user` code
@@ -41,21 +52,23 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::Child;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{Local, Timelike};
-use lh_contributor_client::api::{ApiClient, Credentials};
-use lh_contributor_client::config::{save_credentials, Config, StagingConfig};
+use lh_contributor_client::api::{ApiClient, Credentials, LlmCapability, LlmEndpointKind};
+use lh_contributor_client::config::{save_credentials, Config, LlmConfig, StagingConfig};
 use lh_contributor_client::stats::SlotActivity;
-use lh_contributor_client::{register_request, RunOptions, Runner, StatsHandle};
+use lh_contributor_client::{register_request, register_request_with_llm, RunOptions, Runner, StatsHandle};
 use serde::{Deserialize, Serialize};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tokio::sync::watch;
 use tauri::{AppHandle, Manager};
 
-use crate::settings::{self, FieldError, GuiSettings};
+use crate::settings::{self, FieldError, GuiSettings, LlmMode};
+use crate::sidecar::{self, LaneState, LaneStatus, DEFAULT_MODEL};
 
 pub const TRAY_ID: &str = "lh-contributor-tray";
 
@@ -80,6 +93,20 @@ const LEASE_LOOKUP_MAX_ATTEMPTS: u8 = 3;
 /// Why the current pause exists (UiStatus.pause_reason). 0 = not paused.
 pub const PAUSE_USER: u8 = 1;
 pub const PAUSE_SCHEDULE: u8 = 2;
+/// Local-model chat/completions timeout (SDK default; the classify lane is
+/// generous with CPU inference on purpose).
+const LLM_TIMEOUT_SECS: u64 = 240;
+/// Health budget when Start must bring the sidecar up itself (cold llama.cpp
+/// model load on a weak CPU can legitimately take a while).
+const SIDECAR_START_HEALTH_SECS: u64 = 120;
+/// Health budget for safety-monitor respawns (tighter: the loop is already
+/// running and classify leases deserve a prompt return).
+const SIDECAR_MONITOR_HEALTH_SECS: u64 = 45;
+/// Safety-monitor tick.
+const SIDECAR_POLL_SECS: u64 = 10;
+/// Max consecutive safety respawns before giving up and surfacing the error
+/// (crash-looping llama-server must not burn a machine forever).
+const SIDECAR_MAX_RESPAWN: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -128,6 +155,8 @@ struct ActiveRun {
     final_uptime_secs: u64,
 }
 
+/// Local Model lane bookkeeping lives in `sidecar::LaneState` (imported).
+
 pub struct AppState {
     data_dir: PathBuf,
     settings: Mutex<GuiSettings>,
@@ -151,6 +180,16 @@ pub struct AppState {
     community: Mutex<Option<CommunityStats>>,
     community_next_attempt_ms: AtomicI64,
     community_fetching: AtomicBool,
+    /// Local Model lane bookkeeping (Settings model-status row + the `llm`
+    /// field of the status poll).
+    lane: Mutex<LaneState>,
+    /// OUR llama-server child (Auto mode). Always stopped+reaped when the
+    /// run loop stops — no orphaned processes (the point of this card).
+    sidecar: Mutex<Option<Child>>,
+    /// A bundled-model download is in flight (swap-guarded).
+    download_active: AtomicBool,
+    /// Consecutive safety-monitor respawns since the last healthy state.
+    respawn_attempts: AtomicU8,
     /// Tray handle access for the Pause⇄Resume label flip. `None` in tests
     /// (no tray exists there — the lifecycle code paths run unchanged).
     app: Option<AppHandle>,
@@ -177,6 +216,10 @@ impl AppState {
             community: Mutex::new(None),
             community_next_attempt_ms: AtomicI64::new(0),
             community_fetching: AtomicBool::new(false),
+            lane: Mutex::new(LaneState::default()),
+            sidecar: Mutex::new(None),
+            download_active: AtomicBool::new(false),
+            respawn_attempts: AtomicU8::new(0),
             app,
             pause_reason: AtomicU8::new(0),
         }
@@ -314,6 +357,249 @@ impl AppState {
         let _ = built;
     }
 
+    // -----------------------------------------------------------------------
+    // Local Model lane (t_3067589d)
+    // -----------------------------------------------------------------------
+
+    fn lane_status(&self) -> LaneStatus {
+        guard(&self.lane).status
+    }
+
+    /// Set lane status + detail line. Progress is only meaningful while
+    /// downloading and gets cleared otherwise.
+    fn set_lane(&self, status: LaneStatus, detail: Option<String>) {
+        let mut lane = guard(&self.lane);
+        lane.status = status;
+        lane.detail = detail;
+        if status != LaneStatus::Downloading {
+            lane.progress = None;
+        }
+    }
+
+    /// Is OUR tracked sidecar child alive? A dead child is reaped right here.
+    /// A volunteer's own llama-server is never tracked at all — the app
+    /// must not kill what it didn't start.
+    fn sidecar_child_alive(&self) -> bool {
+        let mut slot = guard(&self.sidecar);
+        match slot.as_mut() {
+            Some(child) => match child.try_wait() {
+                Ok(None) => true,
+                _ => {
+                    slot.take(); // reaped
+                    false
+                }
+            },
+            None => false,
+        }
+    }
+
+    /// Stop (SIGTERM→SIGKILL, always reaped) our sidecar child if any, then
+    /// re-derive the lane: model on disk → `model_ready` (it comes back with
+    /// the next loop start), otherwise honest off/missing state.
+    fn stop_sidecar(&self) {
+        if let Some(child) = guard(&self.sidecar).take() {
+            sidecar::stop_child(child);
+        }
+        let auto = self.settings_snapshot().local_model.mode == LlmMode::Auto;
+        let model_ready = sidecar::model_is_ready(&self.data_dir, &DEFAULT_MODEL);
+        let mut lane = guard(&self.lane);
+        lane.pid = None;
+        lane.spawned_by_us = false;
+        lane.status = if auto {
+            if model_ready {
+                LaneStatus::ModelReady
+            } else {
+                LaneStatus::ModelMissing
+            }
+        } else {
+            LaneStatus::Off
+        };
+        lane.progress = None;
+    }
+
+    /// The gate Start/Resume/Register all pass through. Returns:
+    /// `Ok(None)` — mode None (the byte-identical disabled path);
+    /// `Ok(Some(config))` — enabled AND healthy, safe for `Config.llm` +
+    /// capability declaration; `Err` — enabled but not healthy, carrying the
+    /// human-readable refusal (lane bookkeeping already shows why).
+    async fn ensure_llm_ready(&self, health_budget: Duration) -> Result<Option<LlmConfig>, String> {
+        let lm = self.settings_snapshot().local_model.clone();
+        match lm.mode {
+            LlmMode::None => {
+                // Byte-identical disabled path: no probe, no spawn, no
+                // declaration. Lane bookkeeping is reset and a child left by
+                // a mode switch is never kept behind.
+                if self.sidecar_child_alive() {
+                    self.stop_sidecar();
+                }
+                let mut lane = guard(&self.lane);
+                lane.status = LaneStatus::Off;
+                lane.detail = None;
+                lane.progress = None;
+                lane.pid = None;
+                lane.spawned_by_us = false;
+                Ok(None)
+            }
+            LlmMode::Custom => {
+                let base = sidecar::resolved_endpoint(&lm);
+                match sidecar::probe_endpoint(&base).await {
+                    Ok(()) => {
+                        self.set_lane(LaneStatus::Ready, None);
+                        Ok(self.build_llm_config())
+                    }
+                    Err(e) => {
+                        self.set_lane(LaneStatus::Unhealthy, Some(e.clone()));
+                        Err(format!("the custom endpoint {base} did not answer (GET /health, then /v1/models): {e}"))
+                    }
+                }
+            }
+            LlmMode::Auto => {
+                // 1. Model on disk, verified by a finished download state?
+                if !sidecar::model_is_ready(&self.data_dir, &DEFAULT_MODEL) {
+                    if self.download_active.load(Ordering::Relaxed) {
+                        let prog = {
+                            let lane = guard(&self.lane);
+                            lane.progress
+                        };
+                        let suffix = prog
+                            .map(|(d, t)| if t > 0 { format!(" ({d} / {t} bytes)") } else { String::new() })
+                            .unwrap_or_default();
+                        return Err(format!(
+                            "the bundled model is still downloading{suffix} — Start again once the model row under Settings ▸ Local Model shows Ready"
+                        ));
+                    }
+                    self.set_lane(LaneStatus::ModelMissing, None);
+                    return Err(format!(
+                        "the bundled model is not downloaded yet — it normally starts automatically when Auto-configure is saved; press Download model under Settings ▸ Local Model, then Start (bundled choice: {})",
+                        sidecar::model_caption(&DEFAULT_MODEL)
+                    ));
+                }
+                // 2. Already healthy with our live child? Fast path.
+                if self.lane_status() == LaneStatus::Ready && self.sidecar_child_alive() {
+                    return Ok(self.build_llm_config());
+                }
+                // 3. An already-running local server answering the endpoint
+                //    (Auto mode's endpoint override doubles as "I run my
+                //    own llama-server on this port") — adopt it; the app
+                //    never claims ownership of a server it didn't start.
+                let base = sidecar::resolved_endpoint(&lm);
+                if sidecar::probe_endpoint(&base).await.is_ok() {
+                    let mut lane = guard(&self.lane);
+                    lane.status = LaneStatus::Ready;
+                    lane.detail = None;
+                    lane.progress = None;
+                    lane.pid = None;
+                    lane.spawned_by_us = false;
+                    return Ok(self.build_llm_config());
+                }
+                // 4. Binary resolvable?
+                if sidecar::resolve_binary(&lm.llama_server_bin).is_none() {
+                    let msg = if !lm.llama_server_bin.trim().is_empty() {
+                        format!(
+                            "llama-server override {:#?} is not a file — fix the path under Settings ▸ Local Model ▸ Advanced, clear it to search PATH, or switch the mode to Custom endpoint",
+                            lm.llama_server_bin.trim()
+                        )
+                    } else {
+                        "no llama-server binary found on PATH — install llama.cpp, point Settings ▸ Local Model ▸ Advanced at your binary, or switch the Local Model mode to Custom endpoint".to_string()
+                    };
+                    self.set_lane(LaneStatus::BinaryMissing, Some(msg.clone()));
+                    return Err(msg);
+                }
+                // 5. Spawn ours with the cap flags; health budget is hard.
+                let stale = guard(&self.sidecar).take();
+                if let Some(child) = stale {
+                    sidecar::stop_child(child);
+                }
+                let child = match sidecar::spawn_sidecar(&lm, &self.data_dir, &DEFAULT_MODEL) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        self.set_lane(LaneStatus::Unhealthy, Some(e.clone()));
+                        return Err(e);
+                    }
+                };
+                let pid = child.id();
+                *guard(&self.sidecar) = Some(child);
+                {
+                    let mut lane = guard(&self.lane);
+                    lane.status = LaneStatus::Starting;
+                    lane.detail = None;
+                    lane.progress = None;
+                    lane.pid = Some(pid);
+                    lane.spawned_by_us = true;
+                }
+                match sidecar::wait_healthy(&base, health_budget).await {
+                    Ok(()) => {
+                        self.respawn_attempts.store(0, Ordering::Relaxed);
+                        let mut lane = guard(&self.lane);
+                        lane.status = LaneStatus::Ready;
+                        lane.detail = None;
+                        Ok(self.build_llm_config())
+                    }
+                    Err(e) => {
+                        let child = guard(&self.sidecar).take();
+                        if let Some(child) = child {
+                            sidecar::stop_child(child);
+                        }
+                        let tail = sidecar::log_tail(&self.data_dir, 8);
+                        let detail = format!(
+                            "the local model sidecar did not answer {} within {} s: {}{}",
+                            base,
+                            health_budget.as_secs(),
+                            e,
+                            if tail.is_empty() { String::new() } else { format!(" — last llama-server.log lines:\n{tail}") }
+                        );
+                        self.set_lane(LaneStatus::Unhealthy, Some(detail.clone()));
+                        Err(detail)
+                    }
+                }
+            }
+        }
+    }
+
+    /// The SDK `Config.llm` shape from persisted settings + live lane facts
+    /// (`ensure_llm_ready` decides WHEN it is used; health gates it).
+    fn build_llm_config(&self) -> Option<LlmConfig> {
+        let lm = self.settings_snapshot().local_model.clone();
+        match lm.mode {
+            LlmMode::None => None,
+            LlmMode::Auto => Some(LlmConfig {
+                base_url: sidecar::resolved_endpoint(&lm),
+                api_key: None,
+                model: DEFAULT_MODEL.id.to_string(),
+                timeout_secs: LLM_TIMEOUT_SECS,
+                capability: LlmCapability {
+                    model_family: DEFAULT_MODEL.family.to_string(),
+                    quant: Some(DEFAULT_MODEL.quant.to_string()),
+                    ctx_tokens: lm.ctx_tokens,
+                    // Honest declaration: `local-sidecar` only for a sidecar
+                    // WE started; a healthy server the volunteer runs
+                    // themselves is declared `custom-local`.
+                    endpoint_kind: if guard(&self.lane).spawned_by_us {
+                        LlmEndpointKind::LocalSidecar
+                    } else {
+                        LlmEndpointKind::CustomLocal
+                    },
+                },
+            }),
+            LlmMode::Custom => {
+                let base = sidecar::resolved_endpoint(&lm);
+                let name = lm.model_name.trim().to_string();
+                Some(LlmConfig {
+                    base_url: base.clone(),
+                    api_key: settings::read_llm_key(&self.data_dir),
+                    model: if name.is_empty() { "unknown".to_string() } else { name.clone() },
+                    timeout_secs: LLM_TIMEOUT_SECS,
+                    capability: LlmCapability {
+                        model_family: if name.is_empty() { "unknown".to_string() } else { name },
+                        quant: None,
+                        ctx_tokens: lm.ctx_tokens,
+                        endpoint_kind: sidecar::custom_endpoint_kind(&base),
+                    },
+                })
+            }
+        }
+    }
+
     /// Resolve LH_* staging env the same way the lib's `Config::from_env`
     /// does; real (non-dry) runs without R2/presign env are refused by
     /// `Runner::new` with its own explanatory error.
@@ -380,7 +666,7 @@ impl AppState {
         }
     }
 
-    fn build_config(&self) -> Result<(Config, bool), String> {
+    fn build_config(&self, llm_cfg: Option<LlmConfig>) -> Result<(Config, bool), String> {
         let s = self.settings_snapshot();
         let key = s.resolved_public_key();
         if key.len() != 64 || !key.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -402,10 +688,11 @@ impl AppState {
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
             http_timeout_secs: 60,
-            // LLM grading lane: not configured in the GUI yet — the Local
-            // Model card (sidecar task) wires this from Settings. None means
-            // the tracker never leases classify chunks to this client.
-            llm: None,
+            // Local Model lane: Some only when ensure_llm_ready found the
+            // mode enabled AND the lane healthy — the capability declaration
+            // and classify leases follow exactly that health. Mode None
+            // keeps this None, byte-identical to the pre-change app.
+            llm: llm_cfg,
         };
         Ok((cfg, s.dry_run))
     }
@@ -418,7 +705,7 @@ impl AppState {
 /// Spawn the lib run loop for the currently persisted settings. Shared by
 /// the Start/Resume commands, the tray Resume item, and the schedule
 /// auto-resume — the single code path the pause/resume tests exercise.
-pub fn begin_run(st: &Arc<AppState>) -> Result<(), String> {
+pub async fn begin_run(st: &Arc<AppState>) -> Result<(), String> {
     {
         let active = guard(&st.active);
         if active.as_ref().is_some_and(|r| !r.finished) {
@@ -437,15 +724,28 @@ pub fn begin_run(st: &Arc<AppState>) -> Result<(), String> {
     // New Runner → its uptime starts at 0; reset the accumulation anchor.
     st.runtime_prev_uptime.store(0, Ordering::Relaxed);
     st.pause_reason.store(0, Ordering::Relaxed);
+    st.respawn_attempts.store(0, Ordering::Relaxed);
 
     let fail = |msg: String| {
+        // A failed start must not leave a half-spawned sidecar behind.
+        if st.sidecar_child_alive() {
+            st.stop_sidecar();
+        }
         *guard(&st.last_error) = Some(msg.clone());
         st.set_phase(Phase::Error);
         st.set_pause_label();
         msg
     };
 
-    let (cfg, dry_run) = match st.build_config() {
+    // Local Model gate: Start refuses with a human-readable reason when a
+    // mode is enabled but the lane isn't healthy. Mode None returns Ok(None)
+    // touching no sidecar path → Config.llm stays None → byte-identical
+    // pre-change behavior.
+    let llm_cfg = match st.ensure_llm_ready(Duration::from_secs(SIDECAR_START_HEALTH_SECS)).await {
+        Ok(v) => v,
+        Err(e) => return Err(fail(e)),
+    };
+    let (cfg, dry_run) = match st.build_config(llm_cfg) {
         Ok(v) => v,
         Err(e) => return Err(fail(e)),
     };
@@ -476,6 +776,11 @@ pub fn begin_run(st: &Arc<AppState>) -> Result<(), String> {
     let st = st.clone();
     tauri::async_runtime::spawn(async move {
         let result = runner.run().await;
+        // The run loop is over (paused, finished, or errored): reap our
+        // sidecar — an enabled app never leaves a llama-server behind when
+        // the loop isn't running. The safety monitor is the backstop if
+        // this hook is ever skipped.
+        st.stop_sidecar();
         let was_user_stop = guard(&st.active)
             .as_ref()
             .map(|r| r.stop_requested)
@@ -526,7 +831,13 @@ pub fn toggle_pause(app: &AppHandle) {
         }
         Phase::Starting | Phase::Stopping => {}
         _ => {
-            let _ = begin_run(st.inner());
+            // begin_run is async (the sidecar health wait can take minutes);
+            // the tray closure can't await — failures surface through phase +
+            // last_error, which the UI polls.
+            let st2: Arc<AppState> = st.inner().clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = begin_run(&st2).await;
+            });
         }
     }
 }
@@ -545,6 +856,17 @@ pub fn graceful_shutdown_and_exit(app: &AppHandle) {
         std::thread::sleep(Duration::from_millis(2500));
         handle.exit(0);
     });
+}
+
+/// Last-ditch orphan protection: fires on every `RunEvent::ExitRequested`
+/// route (tray Quit, `handle.exit(0)`, window shutdown) — including routes
+/// that skip graceful shutdown. A sidecar child must never outlive the app.
+pub fn emergency_kill_sidecar(app: &AppHandle) {
+    if let Some(st) = app.try_state::<Arc<AppState>>() {
+        if st.sidecar_child_alive() {
+            st.stop_sidecar();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -577,7 +899,16 @@ pub fn start_background_tasks(st: &Arc<AppState>) {
     tauri::async_runtime::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(SCHEDULE_POLL_SECS)).await;
-            schedule_tick(&s);
+            schedule_tick(&s).await;
+        }
+    });
+    // Sidecar safety net (t_3067589d): respawn a dead child while the loop
+    // runs (with budget), reap a child outliving the loop.
+    let s = st.clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(SIDECAR_POLL_SECS)).await;
+            sidecar_monitor(&s).await;
         }
     });
 }
@@ -586,7 +917,7 @@ pub fn start_background_tasks(st: &Arc<AppState>) {
 /// stopped (schedule reason); when the window opens again, only a
 /// schedule-stopped loop auto-resumes — a user Pause is honored until the
 /// user resumes.
-fn schedule_tick(st: &Arc<AppState>) {
+async fn schedule_tick(st: &Arc<AppState>) {
     if !st.settings_snapshot().schedule.enabled {
         return;
     }
@@ -598,7 +929,178 @@ fn schedule_tick(st: &Arc<AppState>) {
         && phase == Phase::Paused
         && st.pause_reason.load(Ordering::Relaxed) == PAUSE_SCHEDULE
     {
-        let _ = begin_run(st);
+        let _ = begin_run(st).await;
+    }
+}
+
+/// Safety-monitor tick: the sidecar lifecycle convergence loop. While the
+/// run loop is Running it keeps the lane healthy — a dead child WE started
+/// gets relaunched within a capped budget (a crash-looping llama-server
+/// must not burn a machine). When the loop isn't Running it reaps any child
+/// outliving it (missed pause hook, mode switch, settings flag change).
+async fn sidecar_monitor(st: &Arc<AppState>) {
+    let auto = st.settings_snapshot().local_model.mode == LlmMode::Auto;
+    match st.phase() {
+        Phase::Idle | Phase::Paused | Phase::Error | Phase::Stopping => {
+            if st.sidecar_child_alive() {
+                st.stop_sidecar();
+            }
+        }
+        Phase::Running => {
+            if !auto {
+                // A leftover child from an auto→custom/none settings flip
+                // mid-run must go — Custom/None never own a sidecar.
+                if st.sidecar_child_alive() {
+                    st.stop_sidecar();
+                }
+                return;
+            }
+            match st.lane_status() {
+                // begin_run / the download task own these phases.
+                LaneStatus::Off
+                | LaneStatus::ModelMissing
+                | LaneStatus::ModelError
+                | LaneStatus::BinaryMissing
+                | LaneStatus::Downloading
+                | LaneStatus::Starting => return,
+                LaneStatus::Ready | LaneStatus::ModelReady | LaneStatus::Unhealthy => {}
+            }
+            if st.sidecar_child_alive() {
+                st.respawn_attempts.store(0, Ordering::Relaxed);
+                return;
+            }
+            // No live child. Ready + not ours = reusing the volunteer's own
+            // server — nothing to babysit (its loss surfaces as classify
+            // failures and an unhealthy Start/Register later).
+            if st.lane_status() == LaneStatus::Ready && !guard(&st.lane).spawned_by_us {
+                return;
+            }
+            let attempts = st.respawn_attempts.fetch_add(1, Ordering::Relaxed) + 1;
+            if attempts > SIDECAR_MAX_RESPAWN {
+                st.set_lane(
+                    LaneStatus::Unhealthy,
+                    Some(format!(
+                        "the local model sidecar kept exiting ({} restart attempts failed — llama-server.log in the app data dir has the details); check it, then Start again",
+                        attempts - 1
+                    )),
+                );
+                return;
+            }
+            // ensure_llm_ready writes the lane + the human-readable reason
+            // itself; the monitor deliberately doesn't duplicate them.
+            let _ = st
+                .ensure_llm_ready(Duration::from_secs(SIDECAR_MONITOR_HEALTH_SECS))
+                .await;
+        }
+        Phase::Starting => {} // begin_run's own health budget owns this
+    }
+}
+
+/// Kick off the bundled-model download (no-op when one is in flight).
+/// Progress flows into the lane so the Settings model row live-refreshes;
+/// success lands the verified file and flips the lane to `model_ready`.
+fn start_model_download(st: &Arc<AppState>) {
+    if st.download_active.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    {
+        let mut lane = guard(&st.lane);
+        lane.status = LaneStatus::Downloading;
+        lane.detail = None;
+        lane.progress = Some((0, DEFAULT_MODEL.bytes_hint));
+    }
+    let st2 = st.clone();
+    tauri::async_runtime::spawn(async move {
+        let result = sidecar::download_model(
+            &st2.data_dir,
+            &DEFAULT_MODEL,
+            |p| {
+                let mut lane = guard(&st2.lane);
+                lane.status = LaneStatus::Downloading;
+                lane.progress = Some((p.done, p.total));
+            },
+        )
+        .await;
+        st2.download_active.store(false, Ordering::Relaxed);
+        match result {
+            Ok(path) => {
+                let mut lane = guard(&st2.lane);
+                lane.status = LaneStatus::ModelReady;
+                lane.progress = None;
+                lane.detail = Some(format!(
+                    "bundled model verified ({} MB) → {}",
+                    sidecar::on_disk_bytes(&st2.data_dir, &DEFAULT_MODEL) / 1_048_576,
+                    path.display()
+                ));
+            }
+            Err(e) => {
+                let mut lane = guard(&st2.lane);
+                lane.status = LaneStatus::ModelError;
+                lane.progress = None;
+                lane.detail = Some(e.clone());
+                eprintln!("[local model] download failed: {e}");
+            }
+        }
+    });
+}
+
+/// The Settings/dashboard Local Model view from current settings + lane +
+/// on-disk facts (mirrored into the status poll so model/progress rows
+/// live-refresh while a download or sidecar startup is in flight).
+fn llm_view(st: &AppState) -> LlmView {
+    let sidecar_running = st.sidecar_child_alive();
+    let s = st.settings_snapshot();
+    let lm = s.local_model;
+    let lane = guard(&st.lane);
+    let progress = lane.progress.map(|(d, t)| LlmProgressOut {
+        done_bytes: d,
+        total_bytes: t,
+        percent: if t > 0 {
+            ((d as f64 / t as f64) * 100.0).round() as u32
+        } else {
+            0
+        },
+    });
+    let endpoint = if lm.mode == LlmMode::None {
+        None
+    } else {
+        Some(sidecar::resolved_endpoint(&lm))
+    };
+    LlmView {
+        mode: lm.mode.as_str(),
+        status: lane.status.as_str(),
+        detail: lane.detail.clone(),
+        progress,
+        model_line: match lm.mode {
+            LlmMode::None => None,
+            LlmMode::Auto => Some(sidecar::model_caption(&DEFAULT_MODEL)),
+            LlmMode::Custom => {
+                let name = lm.model_name.trim();
+                Some(if name.is_empty() {
+                    sidecar::resolved_endpoint(&lm)
+                } else {
+                    name.to_string()
+                })
+            }
+        },
+        model_bytes_on_disk: if lm.mode == LlmMode::Auto {
+            Some(sidecar::on_disk_bytes(&st.data_dir, &DEFAULT_MODEL))
+        } else {
+            None
+        },
+        cap: lm.cap.as_str(),
+        ctx_tokens: lm.ctx_tokens,
+        endpoint_is_cloud: lm.mode == LlmMode::Custom
+            && sidecar::custom_endpoint_kind(&sidecar::resolved_endpoint(&lm))
+                == LlmEndpointKind::Cloud,
+        binary_found: lm.mode != LlmMode::Auto
+            || sidecar::resolve_binary(&lm.llama_server_bin).is_some(),
+        api_key_present: settings::read_llm_key(&st.data_dir).is_some(),
+        reused_external_server: lane.status == LaneStatus::Ready
+            && !lane.spawned_by_us
+            && lm.mode != LlmMode::None,
+        sidecar_running,
+        endpoint,
     }
 }
 
@@ -755,6 +1257,46 @@ pub struct SlotOut {
     pub target_key: Option<String>,
 }
 
+#[derive(Serialize, Clone)]
+pub struct LlmProgressOut {
+    pub done_bytes: u64,
+    pub total_bytes: u64,
+    pub percent: u32,
+}
+
+/// Live view of the Local Model lane: rendered by the Settings dialog's
+/// "Local Model" section and mirrored into the status poll (so the model
+/// status row live-refreshes while a download or sidecar startup is in
+/// flight). Carries NO secrets — a stored API key is only ever reported as
+/// `api_key_present`.
+#[derive(Serialize, Clone)]
+pub struct LlmView {
+    pub mode: &'static str,
+    /// off | model_missing | downloading | model_error | model_ready |
+    /// binary_missing | starting | ready | unhealthy
+    pub status: &'static str,
+    pub detail: Option<String>,
+    pub progress: Option<LlmProgressOut>,
+    /// Auto: the bundled model caption (family · quant · size · license);
+    /// Custom: the entered model name (or the endpoint); None: null.
+    pub model_line: Option<String>,
+    pub model_bytes_on_disk: Option<u64>,
+    pub cap: &'static str,
+    pub ctx_tokens: u32,
+    pub endpoint: Option<String>,
+    /// Custom mode pointing at a non-local host → the UI shows its
+    /// disclosure line ("search snippets transit this provider").
+    pub endpoint_is_cloud: bool,
+    /// Auto mode: a llama-server binary is locatable.
+    pub binary_found: bool,
+    /// A stored key exists (its value is NEVER sent to the webview).
+    pub api_key_present: bool,
+    /// The healthy endpoint is a server the volunteer already runs —
+    /// reused, and never killed by the app.
+    pub reused_external_server: bool,
+    pub sidecar_running: bool,
+}
+
 #[derive(Serialize)]
 pub struct UiStatus {
     pub phase: &'static str,
@@ -781,6 +1323,8 @@ pub struct UiStatus {
     pub slots: Vec<SlotOut>,
     pub client_version: &'static str,
     pub gui_version: &'static str,
+    /// Local Model lane live view (mode "none" → status "off").
+    pub llm: LlmView,
 }
 
 #[derive(Serialize)]
@@ -799,6 +1343,10 @@ pub struct SettingsView {
     pub credentials_path: String,
     pub credentials_present: bool,
     pub client_id: Option<String>,
+    /// The persisted Local Model config (form initial values). The API key
+    /// is deliberately absent — SettingsView exposes only `llm` (LlmView).
+    pub local_model: settings::LocalModelCfg,
+    pub llm: LlmView,
 }
 
 #[derive(Deserialize)]
@@ -818,6 +1366,16 @@ pub struct ScheduleIn {
 }
 
 #[derive(Deserialize)]
+pub struct LocalModelIn {
+    pub mode: Option<String>,
+    pub cap: Option<String>,
+    pub endpoint: Option<String>,
+    pub llama_server_bin: Option<String>,
+    pub model_name: Option<String>,
+    pub ctx_tokens: Option<u32>,
+}
+
+#[derive(Deserialize)]
 pub struct SettingsInput {
     pub coordinator_url: Option<String>,
     pub public_key_hex: Option<String>,
@@ -825,6 +1383,12 @@ pub struct SettingsInput {
     pub dry_run: Option<bool>,
     pub capabilities: Option<CapabilitiesIn>,
     pub schedule: Option<ScheduleIn>,
+    pub local_model: Option<LocalModelIn>,
+    /// Some replaces/deletes the stored API key (empty string = delete);
+    /// None leaves it untouched. The value goes straight to
+    /// llm_api_key.json (0600, same protection class as credentials.json) —
+    /// never settings.json, never echoed back in any view.
+    pub llm_api_key: Option<String>,
 }
 
 /// Apply a partial update onto the current settings. Validation of the
@@ -872,6 +1436,33 @@ fn merge_settings(current: &GuiSettings, input: &SettingsInput) -> GuiSettings {
             s.schedule.active_until = v.trim().to_string();
         }
     }
+    if let Some(lm) = &input.local_model {
+        if let Some(m) = &lm.mode {
+            if let Some(parsed) = settings::LlmMode::parse(m.trim()) {
+                s.local_model.mode = parsed;
+            }
+        }
+        if let Some(c) = &lm.cap {
+            if let Some(parsed) = settings::ResourceCap::parse(c.trim()) {
+                s.local_model.cap = parsed;
+            }
+        }
+        if let Some(e) = &lm.endpoint {
+            s.local_model.endpoint = e.trim().to_string();
+        }
+        if let Some(b) = &lm.llama_server_bin {
+            s.local_model.llama_server_bin = b.trim().to_string();
+        }
+        if let Some(n) = &lm.model_name {
+            s.local_model.model_name = n.trim().to_string();
+        }
+        if let Some(c) = lm.ctx_tokens {
+            s.local_model.ctx_tokens = c;
+        }
+    }
+    // classify follows the model mode, and endpoints normalize to /v1 —
+    // before validate enforces the invariant.
+    s.normalize_local_model();
     s
 }
 
@@ -923,6 +1514,8 @@ fn settings_view(st: &AppState) -> SettingsView {
         credentials_path: st.creds_path().display().to_string(),
         credentials_present: creds_present,
         client_id: st.credentials().map(|c| c.client_id),
+        local_model: s.local_model.clone(),
+        llm: llm_view(st),
     }
 }
 
@@ -1008,12 +1601,13 @@ pub fn get_status(app: AppHandle) -> UiStatus {
         slots,
         client_version: lh_contributor_client::client_version(),
         gui_version: env!("CARGO_PKG_VERSION"),
+        llm: llm_view(&st),
     }
 }
 
 #[tauri::command]
-pub fn start_contributor(app: AppHandle) -> Result<(), String> {
-    begin_run(app.state::<Arc<AppState>>().inner())
+pub async fn start_contributor(app: AppHandle) -> Result<(), String> {
+    begin_run(app.state::<Arc<AppState>>().inner()).await
 }
 
 #[tauri::command]
@@ -1022,13 +1616,13 @@ pub fn pause_contributor(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn resume_contributor(app: AppHandle) -> Result<(), String> {
+pub async fn resume_contributor(app: AppHandle) -> Result<(), String> {
     let st = app.state::<Arc<AppState>>();
     match st.phase() {
         Phase::Running | Phase::Starting | Phase::Stopping => {
             Err("contributor loop already active — use Pause".to_string())
         }
-        _ => begin_run(st.inner()),
+        _ => begin_run(st.inner()).await,
     }
 }
 
@@ -1041,11 +1635,42 @@ pub async fn register_client(app: AppHandle) -> Result<String, String> {
     ) {
         return Err("pause the contributor loop before re-registering".to_string());
     }
-    let api = st.api_client()?;
-    let creds = api
-        .register(&register_request())
+    // Local Model gate: the llm capability — and with it classify leases —
+    // is declared ONLY when a mode is enabled AND the endpoint probe is
+    // healthy. Mode None skips every sidecar path: byte-identical pre-change
+    // behavior (plain all-capabilities register request, `llm: null`).
+    let llm_cfg = match st
+        .ensure_llm_ready(Duration::from_secs(SIDECAR_MONITOR_HEALTH_SECS))
         .await
-        .map_err(|e| format!("register failed: {e}"))?;
+    {
+        Ok(v) => v,
+        Err(e) => return Err(e),
+    };
+    let api = st.api_client()?;
+    let creds = if st.settings_snapshot().local_model.mode == LlmMode::None {
+        api.register(&register_request())
+            .await
+            .map_err(|e| format!("register failed: {e}"))?
+    } else {
+        // The declared capability must match what `Config.llm` will carry at
+        // Start — capability advertisement and execution ability can never
+        // diverge (DESIGN.md: the tracker never leases classify without it).
+        let cap = match &llm_cfg {
+            Some(l) => l.capability.clone(),
+            // Only a concurrent settings save can clear the gate mid-register;
+            // fall back to the persisted shape build_llm_config defines so the
+            // declaration still matches what Start would build.
+            None => st
+                .build_llm_config()
+                .map(|c| c.capability)
+                .ok_or_else(|| {
+                    "the Local Model mode changed mid-register — press Register again".to_string()
+                })?,
+        };
+        api.register(&register_request_with_llm(Some(&cap)))
+            .await
+            .map_err(|e| format!("register failed: {e}"))?
+    };
     let path = save_credentials(&st.data_dir, &creds)
         .map_err(|e| format!("could not persist credentials: {e}"))?;
     *guard(&st.last_error) = None;
@@ -1084,6 +1709,109 @@ pub async fn check_coordinator(app: AppHandle) -> Result<String, String> {
     }
 }
 
+/// Settings ▸ Local Model ▸ "Download model" — Auto-configure starts this
+/// automatically on first enable; this is the explicit/retry path. Progress
+/// streams into the model status row via the status poll.
+#[tauri::command]
+pub fn download_local_model(app: AppHandle) -> Result<String, String> {
+    let st = app.state::<Arc<AppState>>();
+    if st.settings_snapshot().local_model.mode != LlmMode::Auto {
+        return Err(
+            "the bundled model belongs to Auto-configure — Custom endpoint mode uses a server you run"
+                .to_string(),
+        );
+    }
+    if sidecar::model_is_ready(&st.data_dir, &DEFAULT_MODEL) {
+        st.set_lane(LaneStatus::ModelReady, None);
+        return Ok(format!(
+            "bundled model already downloaded and verified: {}",
+            sidecar::model_caption(&DEFAULT_MODEL)
+        ));
+    }
+    if st.download_active.load(Ordering::Relaxed) {
+        return Ok("download already in progress — the model row shows progress".to_string());
+    }
+    start_model_download(&st);
+    Ok(format!(
+        "download started: {} (resumable, sha256-verified)",
+        sidecar::model_caption(&DEFAULT_MODEL)
+    ))
+}
+
+/// Settings ▸ Local Model ▸ free-the-disk: removes the verified model, any
+/// `.part`, and the download state — and reaps a sidecar that might still
+/// hold the file open. The model row flips to model_missing; re-download
+/// any time (first enable downloads again automatically).
+#[tauri::command]
+pub fn delete_local_model(app: AppHandle) -> Result<String, String> {
+    let st = app.state::<Arc<AppState>>();
+    if st.download_active.load(Ordering::Relaxed) {
+        return Err(
+            "a download is in flight — it resumes safely after an app restart; delete once it finishes or stalls"
+                .to_string(),
+        );
+    }
+    if st.sidecar_child_alive() {
+        st.stop_sidecar();
+    }
+    let freed = sidecar::delete_model(&st.data_dir, &DEFAULT_MODEL);
+    let auto = st.settings_snapshot().local_model.mode == LlmMode::Auto;
+    st.set_lane(
+        if auto {
+            LaneStatus::ModelMissing
+        } else {
+            LaneStatus::Off
+        },
+        if freed > 0 {
+            Some(format!("{} MB freed", freed / 1_048_576))
+        } else {
+            None
+        },
+    );
+    st.respawn_attempts.store(0, Ordering::Relaxed);
+    Ok(if freed > 0 {
+        format!("bundled model removed — {} MB freed", freed / 1_048_576)
+    } else {
+        "no bundled model was on disk (nothing to remove)".to_string()
+    })
+}
+
+/// Settings ▸ Local Model ▸ "Check now": probe the effective endpoint and
+/// refresh the lane — exactly what Start/Register will see next. Auto mode
+/// may bring the sidecar up to answer the probe; while the run loop is not
+/// Running the safety monitor reaps it within ~10s (a sidecar lives only
+/// while the loop runs). Errors are human sentences.
+#[tauri::command]
+pub async fn check_local_model(app: AppHandle) -> Result<String, String> {
+    let st = app.state::<Arc<AppState>>();
+    let mode = st.settings_snapshot().local_model.mode;
+    if mode == LlmMode::None {
+        return Ok("the Local Model is off — nothing to check".to_string());
+    }
+    let budget = if mode == LlmMode::Auto {
+        Duration::from_secs(SIDECAR_MONITOR_HEALTH_SECS)
+    } else {
+        Duration::from_secs(8)
+    };
+    match st.ensure_llm_ready(budget).await {
+        Ok(Some(cfg)) => Ok(format!(
+            "{} is healthy — Start/Register will advertise the search-grading capability ({} · ctx {} tokens){}",
+            cfg.base_url,
+            cfg.capability.model_family,
+            cfg.capability.ctx_tokens,
+            if mode == LlmMode::Auto
+                && cfg.capability.endpoint_kind == LlmEndpointKind::CustomLocal
+            {
+                " — reusing a server you already run; the app did not start it and will not kill it"
+            } else {
+                ""
+            }
+        )),
+        Ok(None) => Err("the Local Model mode changed mid-check — press Check again".to_string()),
+        Err(e) => Err(e),
+    }
+}
+
 #[tauri::command]
 pub fn get_settings_view(app: AppHandle) -> SettingsView {
     settings_view(&app.state::<Arc<AppState>>())
@@ -1095,17 +1823,61 @@ pub fn save_settings(
     input: SettingsInput,
 ) -> Result<SettingsView, FieldError> {
     let st = app.state::<Arc<AppState>>();
+    let prev = st.settings_snapshot();
     let s = {
-        let merged = merge_settings(&st.settings_snapshot(), &input);
+        let merged = merge_settings(&prev, &input);
         merged.validate()?;
         merged
     };
+    // API key first: an IO failure must not half-apply a settings save.
+    // The value lands ONLY in llm_api_key.json — never settings.json,
+    // never a settings view, never the log.
+    if let Some(key) = &input.llm_api_key {
+        settings::write_llm_key(&st.data_dir, Some(key))
+            .map_err(|e| FieldError::new("llm_api_key", e))?;
+    }
     *guard(&st.settings) = s.clone();
     settings::write(&st.data_dir, &s).map_err(|e| FieldError::new("settings_file", e))?;
-    // A schedule edit (or enabling the window) takes effect immediately:
-    // politely stops a now-out-of-window loop / starts a just-in-window
-    // schedule-paused one. No-op when the window is disabled.
-    schedule_tick(st.inner());
+
+    // Local Model lifecycle reaction to the edit — every lane converges
+    // from here; the safety monitor relaunches with fresh flags when needed.
+    let prev_lm = &prev.local_model;
+    let now_lm = &s.local_model;
+    let now_auto = now_lm.mode == LlmMode::Auto;
+    if prev_lm != now_lm {
+        st.respawn_attempts.store(0, Ordering::Relaxed);
+        if st.sidecar_child_alive() {
+            // Cap/ctx/binary/endpoint/mode changed under a live sidecar:
+            // reap it now; the monitor relaunches it with the new flags.
+            st.stop_sidecar();
+        }
+        if now_auto && prev_lm.mode != LlmMode::Auto {
+            // First enable: the card's "first enable downloads" step —
+            // start the bundled model download immediately so the Settings
+            // model row can show progress without waiting for Start.
+            start_model_download(&st);
+        } else if now_auto {
+            st.set_lane(
+                if sidecar::model_is_ready(&st.data_dir, &DEFAULT_MODEL) {
+                    LaneStatus::ModelReady
+                } else if st.download_active.load(Ordering::Relaxed) {
+                    LaneStatus::Downloading
+                } else {
+                    LaneStatus::ModelMissing
+                },
+                None,
+            );
+        } else {
+            st.set_lane(LaneStatus::Off, None);
+        }
+    }
+    // A schedule edit takes effect immediately: politely stop a loop that
+    // just fell out of window / start one that just entered it. begin_run
+    // is async, so the tick runs on the async runtime.
+    let st2: Arc<AppState> = st.inner().clone();
+    tauri::async_runtime::spawn(async move {
+        schedule_tick(&st2).await;
+    });
     Ok(settings_view(&st))
 }
 
@@ -1253,8 +2025,10 @@ mod tests {
                 alt_source: false,
                 state_walk: false,
                 search: false,
+                classify: false,
             },
             schedule: ScheduleCfg::default(),
+            local_model: settings::LocalModelCfg::default(),
         };
         let input = SettingsInput {
             coordinator_url: None,
@@ -1273,6 +2047,8 @@ mod tests {
                 active_from: Some("22:00".to_string()),
                 active_until: Some("06:00".to_string()),
             }),
+            local_model: None,
+            llm_api_key: None,
         };
         let merged = merge_settings(&current, &input);
         assert!(merged.validate().is_ok());
@@ -1298,6 +2074,8 @@ mod tests {
             concurrency: None,
             dry_run: None,
             schedule: None,
+            local_model: None,
+            llm_api_key: None,
         };
         let merged_off = merge_settings(&current, &off);
         assert_eq!(merged_off.validate().unwrap_err().field, "capabilities");
@@ -1410,8 +2188,12 @@ mod tests {
                 alt_source: false,
                 state_walk: false,
                 search: true,
+                classify: false,
             },
             schedule: ScheduleCfg::default(),
+            // Mode None → the lifecycle under test is the pre-change path:
+            // no llm declaration, no sidecar, `Config.llm = None`.
+            local_model: settings::LocalModelCfg::default(),
         };
         let st = Arc::new(AppState::new(dir.clone(), settings, None));
 
@@ -1420,7 +2202,7 @@ mod tests {
             let register_hits = || fake.register_hits.load(Ordering::Relaxed);
 
             // 1. Settings → lib run loop.
-            begin_run(&st).expect("begin_run");
+            begin_run(&st).await.expect("begin_run");
             let deadline = Instant::now() + Duration::from_secs(12);
             while lease_hits() < 3 && Instant::now() < deadline {
                 tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1462,7 +2244,7 @@ mod tests {
             assert_eq!(st.pause_reason.load(Ordering::Relaxed), PAUSE_USER);
 
             // 3. Resume restarts polling and reuses the saved identity.
-            begin_run(&st).expect("resume");
+            begin_run(&st).await.expect("resume");
             tokio::time::sleep(Duration::from_millis(2500)).await;
             assert!(lease_hits() > hits_at_pause, "resume must restart lease polling");
             assert_eq!(

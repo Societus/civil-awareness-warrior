@@ -4,6 +4,7 @@
 
 mod contributor;
 mod settings;
+mod sidecar;
 
 use std::sync::Arc;
 
@@ -103,8 +104,20 @@ fn main() {
             contributor::get_settings_view,
             contributor::save_settings,
             contributor::community_stats,
+            contributor::download_local_model,
+            contributor::delete_local_model,
+            contributor::check_local_model,
             contributor::quit_app
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // Backstop for every shutdown route: whatever quit path fired
+            // (tray Quit, window exit, ExitRequested from handle.exit), a
+            // live sidecar child must never survive the app. graceful_shutdown
+            // already stops it; this covers routes that skip it.
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                contributor::emergency_kill_sidecar(app_handle);
+            }
+        });
 }

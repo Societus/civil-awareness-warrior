@@ -12,11 +12,20 @@ tauri-build = { version = "2", features = [] }
 lh-contributor-client = { path = "../../lh-contributor-client" }
 tauri = { version = "2", features = ["tray-icon"] }
 # /public/stats.json poll (CORS blocks the webview; the Rust side fetches).
-# Same version/features as the client lib so cargo reuses one compiled reqwest.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
+# Same version/features as the client lib so cargo reuses one compiled reqwest;
+# `stream` added for the sidecar model download (bytes_stream) — feature
+# unification means the client lib shares the same single compiled reqwest.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "stream"] }
 # Run-window schedule checks against the LOCAL wall clock. chrono already
 # compiles in this tree (serde_with ← tauri), so this is a zero-cost re-export.
 chrono = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["sync", "time"] }
+# Local Model sidecar (t_3067589d): url/sha2/futures-util already compile in
+# this tree via reqwest + the client lib; libc via tauri's deps. Direct deps
+# so the sidecar code can import them (same zero-cost precedent as chrono).
+url = "2"
+sha2 = "0.10"
+futures-util = "0.3"
+libc = "0.2"
