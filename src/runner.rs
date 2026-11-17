@@ -19,6 +19,7 @@ use crate::api::{
 use crate::chunk::{execute, ExecContext, LeaseContext};
 use crate::config::{save_credentials, Config, StagingConfig};
 use crate::crypto::verify_lease_contract;
+use crate::llm::{LlmEndpoint, LlmLane};
 use crate::rate::RateLimiter;
 use crate::staging::{build_stager, BlobStager};
 use crate::stats::{SlotActivity, StatsHandle};
@@ -61,13 +62,23 @@ impl Default for RunOptions {
     }
 }
 
-/// The register request this client sends: all five chunk types, platform
-/// string `os-arch-rust`, crate version.
+/// The register request this client sends by default: all six chunk types,
+/// platform string `os-arch-rust`, crate version, no llm capability. Hosts
+/// with a configured local-model lane should use
+/// [`register_request_with_llm`] instead so the tracker may lease classify
+/// chunks.
 pub fn register_request() -> RegisterRequest {
+    register_request_with_llm(None)
+}
+
+/// Register request carrying the local-LLM capability when configured.
+/// Declaring it is what makes classify chunks leasable to this client.
+pub fn register_request_with_llm(llm: Option<&crate::api::LlmCapability>) -> RegisterRequest {
     RegisterRequest {
         platform: format!("{}-{}-rust", std::env::consts::OS, std::env::consts::ARCH),
         version: crate::client_version().to_string(),
         capabilities: ALL_CHUNK_TYPES.to_vec(),
+        llm: llm.cloned(),
     }
 }
 
@@ -153,12 +164,16 @@ impl Runner {
         } = self;
 
         // Core loop step 1: register (or load saved client_id + auth_token).
+        // The llm capability rides along when the local-model lane is
+        // configured — declaring it is what unlocks classify chunks.
+        let llm_capability = cfg.llm.as_ref().map(|c| c.capability.clone());
+        let register_req = register_request_with_llm(llm_capability.as_ref());
         let creds = match cfg.credentials.clone() {
             Some(c) => c,
             None => {
                 tracing::info!("no saved credentials; registering a new client identity");
                 let c = api
-                    .register(&register_request())
+                    .register(&register_req)
                     .await
                     .context("register failed")?;
                 let path = save_credentials(&cfg.work_dir, &c)?;
@@ -173,6 +188,37 @@ impl Runner {
             Err(e) => bail!("coordinator health check failed: {e}"),
         }
 
+        // Local-LLM lane (classify grading). Built once; classify leases
+        // without it are impossible in practice (the tracker gates on the
+        // register declaration) and handled as typed failures if they slip
+        // through anyway.
+        let llm_lane = match &cfg.llm {
+            Some(llm_cfg) => match LlmEndpoint::new(
+                &llm_cfg.base_url,
+                llm_cfg.api_key.clone(),
+                &llm_cfg.model,
+                Duration::from_secs(llm_cfg.timeout_secs),
+            ) {
+                Ok(endpoint) => {
+                    tracing::info!(
+                        base_url = %llm_cfg.base_url,
+                        model_family = %llm_cfg.capability.model_family,
+                        endpoint_kind = %llm_cfg.capability.endpoint_kind.as_str(),
+                        "local-LLM grading lane active (classify chunks enabled)"
+                    );
+                    Some(LlmLane {
+                        endpoint,
+                        capability: llm_cfg.capability.clone(),
+                    })
+                }
+                Err(e) => bail!("LLM lane configured but unusable: {e}"),
+            },
+            None => {
+                tracing::info!("no LLM lane configured; classify chunks will not be leased");
+                None
+            }
+        };
+
         let source_http = reqwest::Client::builder()
             .timeout(Duration::from_secs(cfg.http_timeout_secs))
             .build()
@@ -184,6 +230,7 @@ impl Runner {
             source_http,
             capabilities,
             dry_run,
+            llm_lane,
             shutdown_tx,
             consecutive_verify_failures: AtomicU32::new(0),
             re_register_used: AtomicBool::new(false),
@@ -257,6 +304,8 @@ struct RunState {
     source_http: reqwest::Client,
     capabilities: Vec<ChunkType>,
     dry_run: bool,
+    /// Local-LLM grading lane (classify chunks); None = not configured.
+    llm_lane: Option<LlmLane>,
     shutdown_tx: watch::Sender<bool>,
     /// Consecutive contract-verification failures; abort the run beyond 3
     /// (a persistently bad signature is tampering or a wrong public key —
@@ -346,7 +395,9 @@ async fn lease_round(
             tracing::warn!("lease auth rejected; re-registering once");
             let creds = state
                 .api
-                .register(&register_request())
+                .register(&register_request_with_llm(
+                    state.cfg.llm.as_ref().map(|c| &c.capability),
+                ))
                 .await
                 .context("emergency re-register failed")?;
             let path = save_credentials(&state.cfg.work_dir, &creds)?;
@@ -471,6 +522,8 @@ async fn lease_round(
         lease: LeaseContext::from_lease(&lease),
         user_agent: format!("lh-contributor/{} (+lh-tracker)", crate::client_version()),
         brave_api_key: state.cfg.brave_api_key.clone(),
+        llm: state.llm_lane.clone(),
+        search_proxy: Some(state.api.search_proxy(&creds_snapshot)),
         lease_lost: lost_rx,
         dry_run: state.dry_run,
     };
@@ -616,6 +669,7 @@ mod tests {
             staging,
             brave_api_key: None,
             http_timeout_secs: 60,
+            llm: None,
         }
     }
 

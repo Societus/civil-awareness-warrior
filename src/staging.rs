@@ -24,8 +24,12 @@ use url::Url;
 pub trait BlobStager: Send + Sync {
     /// Upload one blob. `key` is the full staging key, already prefixed with
     /// the lease's `staging_upload_prefix`.
-    async fn put_object(&self, key: &str, content_type: &str, bytes: Vec<u8>)
-        -> Result<(), StageError>;
+    async fn put_object(
+        &self,
+        key: &str,
+        content_type: &str,
+        bytes: Vec<u8>,
+    ) -> Result<(), StageError>;
 
     /// Fetch a blob back (examination chunks read staged blobs).
     async fn get_object(&self, key: &str) -> Result<Vec<u8>, StageError>;
@@ -121,12 +125,7 @@ pub fn amz_dates(unix_secs: u64) -> (String, String) {
 }
 
 /// SigV4 signing key derivation (HMAC chain).
-pub fn sigv4_signing_key(
-    secret: &str,
-    date_stamp: &str,
-    region: &str,
-    service: &str,
-) -> Vec<u8> {
+pub fn sigv4_signing_key(secret: &str, date_stamp: &str, region: &str, service: &str) -> Vec<u8> {
     type HmacSha256 = Hmac<Sha256>;
     let mut k = HmacSha256::new_from_slice(format!("AWS4{secret}").as_bytes())
         .expect("hmac accepts any key length");
@@ -173,7 +172,10 @@ pub fn sigv4_signature(input: &SigV4Input) -> String {
         input.canonical_uri, "", canonical_headers, signed_headers, input.payload_sha256_hex
     );
 
-    let scope = format!("{}/{}/{}/aws4_request", input.date_stamp, input.region, input.service);
+    let scope = format!(
+        "{}/{}/{}/aws4_request",
+        input.date_stamp, input.region, input.service
+    );
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n{}\n{}\n{}",
         input.amz_date,
@@ -260,7 +262,11 @@ impl R2Stager {
             service: self.service,
         };
         let signature = sigv4_signature(&input);
-        let url = format!("{}{}", self.endpoint.as_str().trim_end_matches('/'), input.canonical_uri);
+        let url = format!(
+            "{}{}",
+            self.endpoint.as_str().trim_end_matches('/'),
+            input.canonical_uri
+        );
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -279,7 +285,10 @@ impl R2Stager {
             reqwest::header::AUTHORIZATION,
             HeaderValue::from_str(&auth).expect("auth header is header-safe"),
         );
-        (Url::parse(&url).expect("canonical uri is a valid url"), headers)
+        (
+            Url::parse(&url).expect("canonical uri is a valid url"),
+            headers,
+        )
     }
 }
 
@@ -348,20 +357,32 @@ impl R2Stager {
             "GET\n{}\n{}\n{}\n{}\n{}",
             canonical_uri, "", canonical_headers, signed_headers, payload_sha256_hex
         );
-        let scope = format!("{}/{}/{}/aws4_request", date_stamp, self.region, self.service);
+        let scope = format!(
+            "{}/{}/{}/aws4_request",
+            date_stamp, self.region, self.service
+        );
         let string_to_sign = format!(
             "AWS4-HMAC-SHA256\n{}\n{}\n{}",
             amz_date,
             scope,
             hex::encode(Sha256::digest(canonical_request.as_bytes()))
         );
-        let key = sigv4_signing_key(&self.secret_access_key, &date_stamp, self.region, self.service);
+        let key = sigv4_signing_key(
+            &self.secret_access_key,
+            &date_stamp,
+            self.region,
+            self.service,
+        );
         type HmacSha256 = Hmac<Sha256>;
         let mut mac = HmacSha256::new_from_slice(&key).expect("hmac");
         mac.update(string_to_sign.as_bytes());
         let signature = hex::encode(mac.finalize().into_bytes());
 
-        let url = format!("{}{}", self.endpoint.as_str().trim_end_matches('/'), canonical_uri);
+        let url = format!(
+            "{}{}",
+            self.endpoint.as_str().trim_end_matches('/'),
+            canonical_uri
+        );
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             reqwest::header::HeaderName::from_static("x-amz-content-sha256"),
@@ -398,7 +419,8 @@ impl PresignStager {
     }
 
     fn url_for(&self, key: &str) -> String {
-        self.url_template.replace("{key}", &s3_uri_encode(key, true))
+        self.url_template
+            .replace("{key}", &s3_uri_encode(key, true))
     }
 }
 
@@ -423,7 +445,13 @@ impl BlobStager for PresignStager {
         }
         Err(StageError::Http {
             status,
-            body: resp.text().await.unwrap_or_default().chars().take(512).collect(),
+            body: resp
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(512)
+                .collect(),
         })
     }
 
@@ -435,7 +463,13 @@ impl BlobStager for PresignStager {
         }
         Err(StageError::Http {
             status,
-            body: resp.text().await.unwrap_or_default().chars().take(512).collect(),
+            body: resp
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(512)
+                .collect(),
         })
     }
 }
@@ -455,7 +489,9 @@ impl LocalStager {
 
     fn path_for(&self, key: &str) -> Result<PathBuf, StageError> {
         if key.split('/').any(|seg| seg == ".." || seg.is_empty()) {
-            return Err(StageError::BadKey(format!("key contains empty or '..' segment: {key}")));
+            return Err(StageError::BadKey(format!(
+                "key contains empty or '..' segment: {key}"
+            )));
         }
         Ok(self.root.join(key))
     }
@@ -498,9 +534,9 @@ pub fn build_stager(
     http: reqwest::Client,
 ) -> Result<std::sync::Arc<dyn BlobStager>, StageError> {
     match cfg {
-        crate::config::StagingConfig::PresignTemplate { url_template } => {
-            Ok(std::sync::Arc::new(PresignStager::new(http, url_template.clone())))
-        }
+        crate::config::StagingConfig::PresignTemplate { url_template } => Ok(std::sync::Arc::new(
+            PresignStager::new(http, url_template.clone()),
+        )),
         crate::config::StagingConfig::R2 {
             endpoint,
             bucket,
@@ -553,10 +589,16 @@ mod tests {
 
     #[test]
     fn uri_encode_keeps_unreserved_and_slashes() {
-        assert_eq!(s3_uri_encode("stage/raw/ingest/WI/55011/a b.zst", true), "stage/raw/ingest/WI/55011/a%20b.zst");
+        assert_eq!(
+            s3_uri_encode("stage/raw/ingest/WI/55011/a b.zst", true),
+            "stage/raw/ingest/WI/55011/a%20b.zst"
+        );
         // keep_slash=false encodes EVERYTHING outside the unreserved set
         // (used for query-string values, not canonical paths).
-        assert_eq!(s3_uri_encode("stage/raw/a+b=c", false), "stage%2Fraw%2Fa%2Bb%3Dc");
+        assert_eq!(
+            s3_uri_encode("stage/raw/a+b=c", false),
+            "stage%2Fraw%2Fa%2Bb%3Dc"
+        );
     }
 
     /// Cross-language vector: canonical request, string-to-sign and final
@@ -594,7 +636,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("lh-stager-test-{}", std::process::id()));
         let stager = LocalStager::new(&dir);
         stager
-            .put_object("stage/raw/a/b.bin", "application/octet-stream", b"hello".to_vec())
+            .put_object(
+                "stage/raw/a/b.bin",
+                "application/octet-stream",
+                b"hello".to_vec(),
+            )
             .await
             .unwrap();
         let got = stager.get_object("stage/raw/a/b.bin").await.unwrap();

@@ -49,6 +49,8 @@ fn exec_ctx(_server: &MockServer, staging_root: &std::path::Path) -> ExecContext
         },
         user_agent: "lh-contributor/test".to_string(),
         brave_api_key: None,
+        llm: None,
+        search_proxy: None,
         lease_lost: lost_rx,
         dry_run: true,
     }
@@ -72,19 +74,13 @@ async fn ingest_fetches_pages_hashes_and_stages() {
     Mock::given(method("GET"))
         .and(path("/v2/parcels"))
         .and(query_param("page", "1"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_string(page1_body),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_string(page1_body))
         .mount(&source)
         .await;
     Mock::given(method("GET"))
         .and(path("/v2/parcels"))
         .and(query_param("page", "2"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_string(page2_body),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_string(page2_body))
         .mount(&source)
         .await;
 
@@ -110,14 +106,22 @@ async fn ingest_fetches_pages_hashes_and_stages() {
     );
 
     let ctx = exec_ctx(&source, &staging_root);
-    let outcome = execute(&ctx, &parse_contract(contract)).await.expect("ingest succeeds");
+    let outcome = execute(&ctx, &parse_contract(contract))
+        .await
+        .expect("ingest succeeds");
 
     let m = &outcome.manifest;
     assert_eq!(m.chunk_type, ChunkType::Ingest);
     assert_eq!(m.target, "WI/55011");
     assert_eq!(m.page_count, 2);
-    assert_eq!(m.page_sha256[0], hex::encode(Sha256::digest(page1_body.as_bytes())));
-    assert_eq!(m.page_sha256[1], hex::encode(Sha256::digest(page2_body.as_bytes())));
+    assert_eq!(
+        m.page_sha256[0],
+        hex::encode(Sha256::digest(page1_body.as_bytes()))
+    );
+    assert_eq!(
+        m.page_sha256[1],
+        hex::encode(Sha256::digest(page2_body.as_bytes()))
+    );
     assert_eq!(
         m.source_urls,
         vec![
@@ -125,11 +129,20 @@ async fn ingest_fetches_pages_hashes_and_stages() {
             format!("{source_uri}/v2/parcels?page=2"),
         ]
     );
-    assert_eq!(m.raw_pages_blob_prefix.as_deref(), Some("stage/raw/test/WI/55011/lease-1/"));
+    assert_eq!(
+        m.raw_pages_blob_prefix.as_deref(),
+        Some("stage/raw/test/WI/55011/lease-1/")
+    );
     assert_eq!(m.extra["blob_encoding"], json!("zstd"));
     // Reconciliation evaluated + passed.
-    assert_eq!(m.reconciliation.as_ref().unwrap()["rules"][0]["passed"], json!(true));
-    assert_eq!(m.reconciliation.as_ref().unwrap()["rules"][1]["passed"], json!(true));
+    assert_eq!(
+        m.reconciliation.as_ref().unwrap()["rules"][0]["passed"],
+        json!(true)
+    );
+    assert_eq!(
+        m.reconciliation.as_ref().unwrap()["rules"][1]["passed"],
+        json!(true)
+    );
 
     // Blobs actually staged as zstd under the lease prefix.
     for (i, key) in outcome.evidence_blobs.iter().enumerate() {
@@ -172,7 +185,9 @@ async fn ingest_content_type_mismatch_is_schema_drift() {
         }),
     );
     let ctx = exec_ctx(&source, &staging_root);
-    let err = execute(&ctx, &parse_contract(contract)).await.expect_err("must fail");
+    let err = execute(&ctx, &parse_contract(contract))
+        .await
+        .expect_err("must fail");
     assert_eq!(err.failure_type, FailureType::SchemaDrift);
     let _ = std::fs::remove_dir_all(staging_root);
 }
@@ -198,7 +213,9 @@ async fn ingest_http_500_maps_to_http_5xx() {
         }),
     );
     let ctx = exec_ctx(&source, &staging_root);
-    let err = execute(&ctx, &parse_contract(contract)).await.expect_err("must fail");
+    let err = execute(&ctx, &parse_contract(contract))
+        .await
+        .expect_err("must fail");
     assert_eq!(err.failure_type, FailureType::Http5xx);
     let _ = std::fs::remove_dir_all(staging_root);
 }
@@ -240,7 +257,9 @@ async fn alt_source_probes_candidates_and_records_findings() {
     );
 
     let ctx = exec_ctx(&source, &staging_root);
-    let outcome = execute(&ctx, &parse_contract(contract)).await.expect("probe succeeds");
+    let outcome = execute(&ctx, &parse_contract(contract))
+        .await
+        .expect("probe succeeds");
     let summary = &outcome.manifest.extra["probe_summary"];
     assert_eq!(summary["candidates"], json!(2));
     // Both candidates transport-answered (200 and 404) → both reachable.
@@ -249,7 +268,10 @@ async fn alt_source_probes_candidates_and_records_findings() {
     assert_eq!(summary["probe_results"][0]["status"], json!(200));
     // The 404 candidate: reachable but recorded as an http_4xx finding.
     assert_eq!(summary["probe_results"][1]["reachable"], json!(true));
-    assert_eq!(summary["probe_results"][1]["failure_type"], json!("http_4xx"));
+    assert_eq!(
+        summary["probe_results"][1]["failure_type"],
+        json!("http_4xx")
+    );
     let _ = std::fs::remove_dir_all(staging_root);
 }
 
@@ -266,7 +288,9 @@ async fn alt_source_extended_probe_flags_fail_fast_without_requests() {
         }),
     );
     let ctx = exec_ctx(&source, &staging_root);
-    let err = execute(&ctx, &parse_contract(contract)).await.expect_err("must fail fast");
+    let err = execute(&ctx, &parse_contract(contract))
+        .await
+        .expect_err("must fail fast");
     assert_eq!(err.failure_type, FailureType::ContractUnknownParser);
     assert!(err.details.contains("enum_services"));
     let _ = std::fs::remove_dir_all(staging_root);
@@ -289,7 +313,9 @@ async fn examination_unknown_parser_fails_with_contract_unknown_parser() {
         }),
     );
     let ctx = exec_ctx(&source, &staging_root);
-    let err = execute(&ctx, &parse_contract(contract)).await.expect_err("registry is empty");
+    let err = execute(&ctx, &parse_contract(contract))
+        .await
+        .expect_err("registry is empty");
     assert_eq!(err.failure_type, FailureType::ContractUnknownParser);
     assert!(err.details.contains("municode_extract_v1"));
     let _ = std::fs::remove_dir_all(staging_root);
@@ -310,7 +336,9 @@ async fn search_unimplemented_backend_fails_typed() {
         }),
     );
     let ctx = exec_ctx(&source, &staging_root);
-    let err = execute(&ctx, &parse_contract(contract)).await.expect_err("must fail typed");
+    let err = execute(&ctx, &parse_contract(contract))
+        .await
+        .expect_err("must fail typed");
     assert_eq!(err.failure_type, FailureType::ContractUnknownParser);
     assert!(err.details.contains("duckduckgo"));
     let _ = std::fs::remove_dir_all(staging_root);
@@ -353,9 +381,14 @@ async fn state_walk_fetches_roster_and_stages_features() {
     );
 
     let ctx = exec_ctx(&source, &staging_root);
-    let outcome = execute(&ctx, &parse_contract(contract)).await.expect("walk succeeds");
+    let outcome = execute(&ctx, &parse_contract(contract))
+        .await
+        .expect("walk succeeds");
     assert_eq!(outcome.manifest.page_count, 1);
-    assert_eq!(outcome.manifest.staged_features_blob.as_deref(), Some("stage/raw/test/WI/55011/lease-1/features.zst"));
+    assert_eq!(
+        outcome.manifest.staged_features_blob.as_deref(),
+        Some("stage/raw/test/WI/55011/lease-1/features.zst")
+    );
     let blob_path = staging_root.join("stage/raw/test/WI/55011/lease-1/features.zst");
     assert!(blob_path.exists(), "features blob must be staged");
     let _ = std::fs::remove_dir_all(staging_root);
@@ -379,7 +412,9 @@ async fn state_walk_mint_violation_is_schema_drift() {
         }),
     );
     let ctx = exec_ctx(&source, &staging_root);
-    let err = execute(&ctx, &parse_contract(contract)).await.expect_err("mint must fail");
+    let err = execute(&ctx, &parse_contract(contract))
+        .await
+        .expect_err("mint must fail");
     assert_eq!(err.failure_type, FailureType::SchemaDrift);
     assert!(err.details.contains("mint_relation"));
     let _ = std::fs::remove_dir_all(staging_root);

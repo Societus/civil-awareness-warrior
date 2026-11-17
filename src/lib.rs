@@ -18,12 +18,13 @@ pub mod chunk;
 pub mod config;
 pub mod crypto;
 pub mod error;
+pub mod llm;
 pub mod rate;
 pub mod runner;
 pub mod staging;
 pub mod stats;
 
-pub use runner::{register_request, RunOptions, Runner};
+pub use runner::{register_request, register_request_with_llm, RunOptions, Runner};
 pub use stats::{SlotActivity, StatsHandle, StatsSnapshot};
 
 /// Client version reported to the coordinator on register.

@@ -6,7 +6,7 @@
 //! raw-page sha256s for coordinator-side byte-hash verification. Any page
 //! failure fails the whole chunk — a partial county fetch is not a result.
 
-use super::{manifest_scaffold, parse_payload, fetch_page, ExecContext, Outcome};
+use super::{fetch_page, manifest_scaffold, parse_payload, ExecContext, Outcome};
 use crate::api::{FailureType, IngestPayload};
 use crate::crypto::canonical_json;
 use crate::error::ChunkFailure;
@@ -67,14 +67,19 @@ pub(crate) async fn execute(
         .await?;
 
         let raw_hash = hex::encode(Sha256::digest(&fetched.bytes));
-        let blob = put_zstd(&*ctx.stager, prefix, &format!("pages/{i:04}"), &fetched.bytes)
-            .await
-            .map_err(|e| {
-                ChunkFailure::new(
-                    FailureType::ClientError,
-                    format!("staging page {i} failed: {e}"),
-                )
-            })?;
+        let blob = put_zstd(
+            &*ctx.stager,
+            prefix,
+            &format!("pages/{i:04}"),
+            &fetched.bytes,
+        )
+        .await
+        .map_err(|e| {
+            ChunkFailure::new(
+                FailureType::ClientError,
+                format!("staging page {i} failed: {e}"),
+            )
+        })?;
         evidence.push(blob.key.clone());
 
         page_hashes.push(raw_hash);
@@ -99,7 +104,9 @@ pub(crate) async fn execute(
             "non_empty" => {
                 // Every page body must be non-empty.
                 let non_empty = fp.pages.len() == page_notes.len()
-                    && page_notes.iter().all(|p| p["raw_bytes"].as_u64().unwrap_or(0) > 0);
+                    && page_notes
+                        .iter()
+                        .all(|p| p["raw_bytes"].as_u64().unwrap_or(0) > 0);
                 all_evaluated_passed &= non_empty;
                 serde_json::json!({
                     "field": rule.field,
@@ -190,8 +197,12 @@ fn build_url(base_url: &str, path: &str) -> Result<Url, ChunkFailure> {
     } else {
         format!("{base_url}/{path}")
     };
-    Url::parse(&joined)
-        .map_err(|e| ChunkFailure::new(FailureType::SchemaDrift, format!("bad fetch plan url {joined:?}: {e}")))
+    Url::parse(&joined).map_err(|e| {
+        ChunkFailure::new(
+            FailureType::SchemaDrift,
+            format!("bad fetch plan url {joined:?}: {e}"),
+        )
+    })
 }
 
 #[cfg(test)]

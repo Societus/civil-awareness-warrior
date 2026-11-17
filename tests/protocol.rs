@@ -109,6 +109,7 @@ async fn register_returns_credentials() {
             platform: "linux-x86_64-rust".to_string(),
             version: "0.1.0".to_string(),
             capabilities: vec![ChunkType::Ingest, ChunkType::Search],
+            llm: None,
         })
         .await
         .unwrap();
@@ -133,11 +134,14 @@ async fn register_rate_limit_maps_retry_after() {
             platform: "p".to_string(),
             version: "0.1.0".to_string(),
             capabilities: vec![],
+            llm: None,
         })
         .await
         .unwrap_err();
     match err {
-        ApiError::RateLimited { retry_after_sec: Some(720) } => {}
+        ApiError::RateLimited {
+            retry_after_sec: Some(720),
+        } => {}
         other => panic!("expected RateLimited(720), got {other:?}"),
     }
 }
@@ -201,7 +205,9 @@ async fn lease_auth_failures_map_to_typed_errors() {
         .await;
     Mock::given(method("POST"))
         .and(path("/v1/lease"))
-        .respond_with(ResponseTemplate::new(403).set_body_json(json!({"error": "client suspended"})))
+        .respond_with(
+            ResponseTemplate::new(403).set_body_json(json!({"error": "client suspended"})),
+        )
         .mount(&server)
         .await;
 
@@ -247,7 +253,10 @@ async fn tampered_contract_fails_verification() {
     };
     let err = verify_lease_contract(&pubkey_hex(), &lease, lh_contributor_client::api::unix_ms())
         .expect_err("tampered contract must fail verification");
-    assert_eq!(err, lh_contributor_client::error::LeaseVerifyError::BadSignature);
+    assert_eq!(
+        err,
+        lh_contributor_client::error::LeaseVerifyError::BadSignature
+    );
 }
 
 #[tokio::test]
@@ -302,7 +311,10 @@ async fn heartbeat_ok_and_expired() {
         .await;
 
     let api = client(&server);
-    let hb = api.heartbeat("c1", "live", Some("executing")).await.unwrap();
+    let hb = api
+        .heartbeat("c1", "live", Some("executing"))
+        .await
+        .unwrap();
     assert!(hb.ok);
     assert_eq!(hb.lease_expires_at, 1234567890123);
 
@@ -346,11 +358,9 @@ async fn result_submission_201_and_conflict() {
             reconciliation: None,
             staged_features_blob: None,
             raw_pages_blob_prefix: Some("stage/raw/ingest/WI/55011/l1/".to_string()),
-            extra: [
-                ("blob_encoding".to_string(), json!("zstd")),
-            ]
-            .into_iter()
-            .collect(),
+            extra: [("blob_encoding".to_string(), json!("zstd"))]
+                .into_iter()
+                .collect(),
         },
         evidence_blobs: vec!["stage/raw/ingest/WI/55011/l1/pages/0000.zst".to_string()],
     };
@@ -443,8 +453,5 @@ async fn lease_poll_query_params_carry_capabilities() {
     assert_eq!(body["client_id"], "c9");
     assert_eq!(body["auth_token"], "t9");
     assert_eq!(body["slot_id"], 7);
-    assert_eq!(
-        body["capabilities"],
-        json!(["state_walk", "search"])
-    );
+    assert_eq!(body["capabilities"], json!(["state_walk", "search"]));
 }

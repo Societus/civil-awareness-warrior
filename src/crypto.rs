@@ -275,11 +275,7 @@ mod tests {
         assert!(!verify_contract(&pub_hex, chunk_id, &tampered));
 
         // Wrong chunk_id -> must fail.
-        assert!(!verify_contract(
-            &pub_hex,
-            "other-chunk",
-            &signed
-        ));
+        assert!(!verify_contract(&pub_hex, "other-chunk", &signed));
 
         // Tampered signature -> must fail.
         let mut bad_sig = signed.clone();

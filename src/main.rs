@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use lh_contributor_client::api::{ApiClient, ChunkType, ALL_CHUNK_TYPES};
 use lh_contributor_client::config::{save_credentials, Config};
-use lh_contributor_client::runner::{register_request, RunOptions, Runner};
+use lh_contributor_client::runner::{register_request_with_llm, RunOptions, Runner};
 use std::time::Duration;
 
 #[derive(Parser)]
@@ -35,7 +35,7 @@ enum Cmd {
         /// Override LH_CONCURRENCY (1..=8).
         #[arg(long)]
         concurrency: Option<u32>,
-        /// Comma-separated chunk types to lease (default: all five).
+        /// Comma-separated chunk types to lease (default: all six).
         #[arg(long)]
         capabilities: Option<String>,
         /// Stage blobs locally and print manifests; never submit results.
@@ -71,8 +71,12 @@ async fn cmd_register() -> Result<()> {
         &cfg.coordinator_url,
         Duration::from_secs(cfg.http_timeout_secs),
     )?;
+    // Declare the local-LLM capability when the lane is configured, so the
+    // tracker may lease classify chunks to this identity.
     let creds = api
-        .register(&register_request())
+        .register(&register_request_with_llm(
+            cfg.llm.as_ref().map(|c| &c.capability),
+        ))
         .await
         .context("register failed")?;
     let path = save_credentials(&cfg.work_dir, &creds)?;

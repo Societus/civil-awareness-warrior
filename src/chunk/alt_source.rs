@@ -129,7 +129,10 @@ pub(crate) async fn execute(
     )
     .await
     .map_err(|e| {
-        ChunkFailure::new(FailureType::ClientError, format!("staging probe report failed: {e}"))
+        ChunkFailure::new(
+            FailureType::ClientError,
+            format!("staging probe report failed: {e}"),
+        )
     })?;
 
     let mut manifest = manifest_scaffold(contract, source_urls, hashes);

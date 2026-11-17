@@ -40,10 +40,9 @@ impl RateLimiter {
     /// Effective budget = min of contract budget and client cap.
     pub fn combined(contract: (u64, u64), client_cap: Option<(u64, u64)>) -> RateLimiter {
         match client_cap {
-            Some((cap_rpm, cap_bpm)) => RateLimiter::new(
-                contract.0.min(cap_rpm),
-                contract.1.min(cap_bpm),
-            ),
+            Some((cap_rpm, cap_bpm)) => {
+                RateLimiter::new(contract.0.min(cap_rpm), contract.1.min(cap_bpm))
+            }
             None => RateLimiter::new(contract.0, contract.1),
         }
     }
@@ -93,7 +92,9 @@ impl RateLimiter {
             let wait = {
                 let mut state = self.state.lock().expect("rate limiter lock");
                 let now = Instant::now();
-                state.byte_events.retain(|(t, _)| now.duration_since(*t) < WINDOW);
+                state
+                    .byte_events
+                    .retain(|(t, _)| now.duration_since(*t) < WINDOW);
                 let used: u64 = state.byte_events.iter().map(|(_, b)| b).sum();
                 if used + bytes <= self.bytes_per_min || used == 0 {
                     // `used == 0` lets a single oversized response through

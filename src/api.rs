@@ -15,12 +15,13 @@ use url::Url;
 // Chunk contracts
 // ---------------------------------------------------------------------------
 
-pub const ALL_CHUNK_TYPES: [ChunkType; 5] = [
+pub const ALL_CHUNK_TYPES: [ChunkType; 6] = [
     ChunkType::Examination,
     ChunkType::Ingest,
     ChunkType::AltSource,
     ChunkType::StateWalk,
     ChunkType::Search,
+    ChunkType::Classify,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -31,6 +32,7 @@ pub enum ChunkType {
     AltSource,
     StateWalk,
     Search,
+    Classify,
 }
 
 impl ChunkType {
@@ -41,6 +43,7 @@ impl ChunkType {
             ChunkType::AltSource => "alt_source",
             ChunkType::StateWalk => "state_walk",
             ChunkType::Search => "search",
+            ChunkType::Classify => "classify",
         }
     }
 
@@ -204,6 +207,88 @@ pub struct SearchPayload {
     pub source_class_priority: Vec<String>,
 }
 
+/// Grading rubric carried by classify contracts; fills the fixed slots of
+/// the built-in prompt template. Instructions live in the template, not here.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClassifyRubric {
+    pub objective: String,
+    #[serde(default)]
+    pub relevant_criteria: Vec<String>,
+    #[serde(default)]
+    pub irrelevant_criteria: Vec<String>,
+}
+
+/// Input reference for a classify chunk: a search-result set fetched through
+/// the tracker's operator-key proxy, or a staged blob fetched via the stager.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ClassifyInput {
+    SearchResultSet { query_plan: QueryPlan },
+    StagedBlob { staged_blob_key: String },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClassifyPayload {
+    /// Built-in prompt template ID (see `crate::llm`). Unknown IDs are a
+    /// typed `contract_unknown_parser` failure, like parser IDs.
+    pub prompt_template_id: String,
+    pub rubric: ClassifyRubric,
+    pub input: ClassifyInput,
+    /// Named verdict schema; only 'classify_verdict_v1' exists. Unknown
+    /// names are a typed failure (operator/client version skew).
+    #[serde(default)]
+    pub verdict_schema: Option<String>,
+    /// Distinct-client verdicts wanted before the chunk retires.
+    /// Informational client-side; the tracker owns retirement.
+    #[serde(default)]
+    pub expected_verdicts: Option<u32>,
+}
+
+// ---------------------------------------------------------------------------
+// LLM capability (register extension)
+// ---------------------------------------------------------------------------
+
+/// Where the grading model runs. Sent to the tracker at register; the tracker
+/// records it (no policy enforced today).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LlmEndpointKind {
+    LocalSidecar,
+    CustomLocal,
+    Cloud,
+}
+
+impl LlmEndpointKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LlmEndpointKind::LocalSidecar => "local-sidecar",
+            LlmEndpointKind::CustomLocal => "custom-local",
+            LlmEndpointKind::Cloud => "cloud",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<LlmEndpointKind> {
+        match s {
+            "local-sidecar" => Some(LlmEndpointKind::LocalSidecar),
+            "custom-local" => Some(LlmEndpointKind::CustomLocal),
+            "cloud" => Some(LlmEndpointKind::Cloud),
+            _ => None,
+        }
+    }
+}
+
+/// Local-LLM capability declared at register when configured. Presence is
+/// what gates classify leases; the fields give the operator grading-quality
+/// context (and future lease policy hooks).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LlmCapability {
+    pub model_family: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quant: Option<String>,
+    pub ctx_tokens: u32,
+    pub endpoint_kind: LlmEndpointKind,
+}
+
 // ---------------------------------------------------------------------------
 // Lease
 // ---------------------------------------------------------------------------
@@ -246,6 +331,10 @@ pub struct RegisterRequest {
     pub platform: String,
     pub version: String,
     pub capabilities: Vec<ChunkType>,
+    /// Local-LLM capability; declares classify-chunk eligibility. Omitted
+    /// entirely (not null) when not configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm: Option<LlmCapability>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -377,6 +466,76 @@ pub struct HealthInfo {
 }
 
 // ---------------------------------------------------------------------------
+// Search proxy (classify input fetch)
+// ---------------------------------------------------------------------------
+
+/// One query's raw result set from the operator-key search proxy.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ProxyQueryResult {
+    pub query: String,
+    pub url: String,
+    #[serde(default)]
+    pub status: Option<u16>,
+    #[serde(default)]
+    pub sha256: Option<String>,
+    #[serde(default)]
+    pub body: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SearchProxyResponse {
+    pub chunk_id: String,
+    pub backend: String,
+    pub fetched_at: i64,
+    pub queries: Vec<ProxyQueryResult>,
+}
+
+/// Handle for `POST /v1/search-proxy` (classify input fetch). Body-carried
+/// auth like every other coordinator call; the query plan is derived
+/// server-side from the signed chunk contract, so the client only ever
+/// sends ids. Build via [`ApiClient::search_proxy`].
+#[derive(Debug, Clone)]
+pub struct SearchProxy {
+    http: reqwest::Client,
+    base: Url,
+    client_id: String,
+    auth_token: String,
+}
+
+impl SearchProxy {
+    /// Fetch the raw result sets for a leased classify chunk's fixed query
+    /// plan. 409 = no active lease; 429 = per-client quota; 503 = operator
+    /// key not configured. None of these are chunk failures — callers decide
+    /// how to map them.
+    pub async fn fetch_classify_input(
+        &self,
+        chunk_id: &str,
+    ) -> Result<SearchProxyResponse, ApiError> {
+        let mut url = self.base.clone();
+        url.path_segments_mut()
+            .expect("base url")
+            .extend(["v1", "search-proxy"]);
+        let body = serde_json::json!({
+            "client_id": self.client_id,
+            "auth_token": self.auth_token,
+            "chunk_id": chunk_id,
+        });
+        let resp = self.http.post(url).json(&body).send().await?;
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        if status == 200 {
+            return serde_json::from_str(&text).map_err(|source| ApiError::Decode {
+                source,
+                body: truncate_body(&text),
+            });
+        }
+        Err(ApiClient::status_error(status, &text))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ApiClient
 // ---------------------------------------------------------------------------
 
@@ -391,10 +550,7 @@ impl ApiClient {
         let base = Url::parse(base_url)
             .map_err(|e| ApiError::BadRequest(format!("invalid LH_COORDINATOR_URL: {e}")))?;
         let http = reqwest::Client::builder()
-            .user_agent(format!(
-                "lh-contributor-client/{}",
-                crate::client_version()
-            ))
+            .user_agent(format!("lh-contributor-client/{}", crate::client_version()))
             .timeout(timeout)
             .build()?;
         Ok(ApiClient { http, base })
@@ -445,7 +601,9 @@ impl ApiClient {
             410 => ApiError::LeaseExpired,
             429 => {
                 let retry = parsed.get("retry_after_sec").and_then(Value::as_u64);
-                ApiError::RateLimited { retry_after_sec: retry }
+                ApiError::RateLimited {
+                    retry_after_sec: retry,
+                }
             }
             400 => ApiError::BadRequest(err_msg),
             s => ApiError::Server {
@@ -474,6 +632,18 @@ impl ApiClient {
             client_id: resp.client_id,
             auth_token: resp.auth_token,
         })
+    }
+
+    /// Build a search-proxy handle bound to this coordinator and identity.
+    /// Used by the classify executor to fetch a leased chunk's fixed query
+    /// plan results without ever seeing the operator's search key.
+    pub fn search_proxy(&self, creds: &Credentials) -> SearchProxy {
+        SearchProxy {
+            http: self.http.clone(),
+            base: self.base.clone(),
+            client_id: creds.client_id.clone(),
+            auth_token: creds.auth_token.clone(),
+        }
     }
 
     pub async fn lease(

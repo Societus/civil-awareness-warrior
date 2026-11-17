@@ -18,10 +18,7 @@ use crate::staging::put_zstd;
 use sha2::{Digest, Sha256};
 
 fn extract_tag(html: &str, tag: &str) -> Option<String> {
-    let re = regex::Regex::new(&format!(
-        r"(?is)<{tag}[^>]*>(.*?)</{tag}>"
-    ))
-    .ok()?;
+    let re = regex::Regex::new(&format!(r"(?is)<{tag}[^>]*>(.*?)</{tag}>")).ok()?;
     re.captures(html)
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().to_string())
@@ -100,7 +97,10 @@ pub(crate) async fn execute(
         if recipe.heading_capture && h1.as_deref().unwrap_or("").is_empty() {
             return Err(ChunkFailure::new(
                 FailureType::SchemaDrift,
-                format!("heading_capture requested but no <h1> found for slug {:?}", entry.slug),
+                format!(
+                    "heading_capture requested but no <h1> found for slug {:?}",
+                    entry.slug
+                ),
             ));
         }
 
@@ -135,7 +135,10 @@ pub(crate) async fn execute(
     )
     .await
     .map_err(|e| {
-        ChunkFailure::new(FailureType::ClientError, format!("staging features blob failed: {e}"))
+        ChunkFailure::new(
+            FailureType::ClientError,
+            format!("staging features blob failed: {e}"),
+        )
     })?;
 
     let mut manifest = manifest_scaffold(contract, source_urls, hashes);

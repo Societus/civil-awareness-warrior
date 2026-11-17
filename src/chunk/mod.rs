@@ -7,15 +7,17 @@
 //! carrying the coordinator failure_type for `/v1/fail`.
 
 pub mod alt_source;
+pub mod classify;
 pub mod examination;
 pub mod ingest;
 pub mod search;
 pub mod state_walk;
 
 use crate::api::{
-    ChunkType, FailureType, LeaseResponse, SignedChunkContract, WorkerManifest,
+    ChunkType, FailureType, LeaseResponse, SearchProxy, SignedChunkContract, WorkerManifest,
 };
 use crate::error::ChunkFailure;
+use crate::llm::LlmLane;
 use crate::rate::RateLimiter;
 use crate::staging::BlobStager;
 use std::sync::Arc;
@@ -51,6 +53,13 @@ pub struct ExecContext {
     pub user_agent: String,
     /// Brave Search API key for search chunks (backend=brave).
     pub brave_api_key: Option<String>,
+    /// Local-LLM grading lane; required for classify chunks. `None` on a
+    /// classify lease is a client wiring bug → typed client_error failure
+    /// (the tracker only leases classify to llm-declared clients anyway).
+    pub llm: Option<LlmLane>,
+    /// Coordinator search proxy for classify input fetches (operator-key
+    /// search without the client ever holding a search key).
+    pub search_proxy: Option<SearchProxy>,
     /// Set true when the heartbeat loop reports the lease as lost/expired —
     /// executors check between units of work and bail out.
     pub lease_lost: watch::Receiver<bool>,
@@ -83,6 +92,7 @@ pub async fn execute(
         ChunkType::StateWalk => state_walk::execute(ctx, contract).await,
         ChunkType::Search => search::execute(ctx, contract).await,
         ChunkType::Examination => examination::execute(ctx, contract).await,
+        ChunkType::Classify => classify::execute(ctx, contract).await,
     }
 }
 
@@ -119,17 +129,17 @@ pub(crate) fn failure_for_status(status: u16, url: &str) -> ChunkFailure {
         s if (500..600).contains(&s) => {
             ChunkFailure::new(FailureType::Http5xx, format!("status {s} at {url}"))
         }
-        s => ChunkFailure::new(
-            FailureType::Http4xx,
-            format!("status {s} at {url}"),
-        ),
+        s => ChunkFailure::new(FailureType::Http4xx, format!("status {s} at {url}")),
     }
 }
 
 /// Map a transport-level reqwest error to a coordinator failure type.
 pub(crate) fn failure_for_transport(err: &reqwest::Error, url: &str) -> ChunkFailure {
     if err.is_timeout() {
-        ChunkFailure::new(FailureType::ClientTimeout, format!("timeout fetching {url}: {err}"))
+        ChunkFailure::new(
+            FailureType::ClientTimeout,
+            format!("timeout fetching {url}: {err}"),
+        )
     } else if err.is_connect() || err.is_request() {
         ChunkFailure::new(
             FailureType::SourceUnreachable,
@@ -168,8 +178,9 @@ pub(crate) async fn fetch_page(
         ));
     }
 
-    let parsed_url = url::Url::parse(url)
-        .map_err(|e| ChunkFailure::new(FailureType::SchemaDrift, format!("bad url {url:?}: {e}")))?;
+    let parsed_url = url::Url::parse(url).map_err(|e| {
+        ChunkFailure::new(FailureType::SchemaDrift, format!("bad url {url:?}: {e}"))
+    })?;
 
     let mut req = ctx.http.request(method, parsed_url);
     for (name, value) in extra_headers {
@@ -185,7 +196,10 @@ pub(crate) async fn fetch_page(
         req = req.body(b.to_string());
     }
 
-    let resp = req.send().await.map_err(|e| failure_for_transport(&e, url))?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| failure_for_transport(&e, url))?;
     let status = resp.status().as_u16();
     if !(200..300).contains(&status) {
         return Err(failure_for_status(status, url));
@@ -199,9 +213,7 @@ pub(crate) async fn fetch_page(
         if !actual.starts_with(expect) {
             return Err(ChunkFailure::new(
                 FailureType::SchemaDrift,
-                format!(
-                    "content-type mismatch at {url}: expected {expect:?}, got {actual:?}"
-                ),
+                format!("content-type mismatch at {url}: expected {expect:?}, got {actual:?}"),
             ));
         }
     }
@@ -245,10 +257,22 @@ mod tests {
 
     #[test]
     fn status_mapping_matches_fail_endpoint_policy() {
-        assert_eq!(failure_for_status(403, "u").failure_type, FailureType::BotWalled);
-        assert_eq!(failure_for_status(429, "u").failure_type, FailureType::BotWalled);
-        assert_eq!(failure_for_status(503, "u").failure_type, FailureType::Http5xx);
-        assert_eq!(failure_for_status(404, "u").failure_type, FailureType::Http4xx);
+        assert_eq!(
+            failure_for_status(403, "u").failure_type,
+            FailureType::BotWalled
+        );
+        assert_eq!(
+            failure_for_status(429, "u").failure_type,
+            FailureType::BotWalled
+        );
+        assert_eq!(
+            failure_for_status(503, "u").failure_type,
+            FailureType::Http5xx
+        );
+        assert_eq!(
+            failure_for_status(404, "u").failure_type,
+            FailureType::Http4xx
+        );
         // http_4xx is the only terminal type server-side; check it stays so.
         assert!(!failure_for_status(404, "u").failure_type.is_retryable());
         assert!(failure_for_status(503, "u").failure_type.is_retryable());

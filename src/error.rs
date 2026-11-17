@@ -48,7 +48,10 @@ impl ApiError {
     pub fn lease_is_lost(&self) -> bool {
         matches!(
             self,
-            ApiError::LeaseExpired | ApiError::NotFound(_) | ApiError::Forbidden | ApiError::Conflict(_)
+            ApiError::LeaseExpired
+                | ApiError::NotFound(_)
+                | ApiError::Forbidden
+                | ApiError::Conflict(_)
         )
     }
 }
@@ -89,6 +92,37 @@ pub enum StageError {
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+/// Local-LLM lane failure (classify executor). Every variant — including
+/// timeout and model garbage — maps to an honest no_verdict result, never a
+/// guessed verdict and never an abort of the lease.
+#[derive(Debug, Error)]
+pub enum LlmError {
+    #[error("llm endpoint misconfigured: {0}")]
+    BadEndpoint(String),
+
+    #[error("llm endpoint transport error: {0}")]
+    Transport(reqwest::Error),
+
+    #[error("llm endpoint timed out")]
+    Timeout,
+
+    #[error("llm endpoint returned status {status}: {body}")]
+    Http { status: u16, body: String },
+
+    #[error("model output is not a schema-valid verdict: {0}")]
+    MalformedVerdict(String),
+}
+
+impl From<reqwest::Error> for LlmError {
+    fn from(err: reqwest::Error) -> Self {
+        if err.is_timeout() {
+            LlmError::Timeout
+        } else {
+            LlmError::Transport(err)
+        }
+    }
 }
 
 /// A chunk execution failure, carrying the coordinator `failure_type` the

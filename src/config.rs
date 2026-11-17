@@ -1,6 +1,6 @@
 //! Environment-driven configuration + credential persistence.
 
-use crate::api::Credentials;
+use crate::api::{Credentials, LlmCapability, LlmEndpointKind};
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -18,6 +18,110 @@ pub enum ConfigError {
 
     #[error("credentials file at {path} is corrupt: {problem}")]
     BadCredentials { path: PathBuf, problem: String },
+}
+
+/// Local-LLM grading lane configuration (classify chunks). Active only when
+/// the capability fields are present in the environment; absent config means
+/// the client never declares the llm capability and simply never receives
+/// classify work (all other chunk types unaffected).
+///
+/// Collapses the GUI's three modes onto one surface: auto-configured
+/// sidecar (base_url = local llama-server), custom local endpoint, or a
+/// cloud OpenAI-compatible provider (base_url + api_key).
+#[derive(Debug, Clone)]
+pub struct LlmConfig {
+    /// OpenAI-compatible base URL (…/v1). Default http://127.0.0.1:8081/v1
+    /// (the llama-server sidecar port).
+    pub base_url: String,
+    /// Optional bearer key for the endpoint (cloud providers). Stored like
+    /// every credential: never logged, sent only to this endpoint.
+    pub api_key: Option<String>,
+    /// Model name for chat/completions. Free-form; llama-server ignores it,
+    /// cloud providers need their exact slug.
+    pub model: String,
+    /// Per-completion timeout. Local CPU inference on long prompts is slow;
+    /// the default is deliberately generous.
+    pub timeout_secs: u64,
+    /// What register declares. Presence of the capability is what activates
+    /// the lane end-to-end.
+    pub capability: LlmCapability,
+}
+
+pub const DEFAULT_LLM_BASE_URL: &str = "http://127.0.0.1:8081/v1";
+const DEFAULT_LLM_MODEL: &str = "landhunter-classifier";
+const DEFAULT_LLM_TIMEOUT_SECS: u64 = 240;
+
+/// Load the LLM lane from LH_LLM_* variables. Ok(None) — lane disabled —
+/// unless BOTH LH_LLM_MODEL_FAMILY and LH_LLM_CTX_TOKENS are set (the two
+/// fields a capability declaration cannot default). Everything else has
+/// defaults; invalid explicit values are errors, not silent fallbacks.
+fn llm_from_env() -> Result<Option<LlmConfig>, ConfigError> {
+    let model_family = env_nonempty("LH_LLM_MODEL_FAMILY");
+    let ctx_tokens = match std::env::var("LH_LLM_CTX_TOKENS") {
+        Ok(v) if !v.trim().is_empty() => {
+            Some(v.trim().parse::<u32>().map_err(|_| ConfigError::BadEnv {
+                var: "LH_LLM_CTX_TOKENS",
+                problem: format!("{v:?} is not a number"),
+            })?)
+        }
+        _ => None,
+    };
+    let (model_family, ctx_tokens) = match (model_family, ctx_tokens) {
+        (None, None) => return Ok(None),
+        (Some(f), Some(c)) => (f, c),
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(ConfigError::BadEnv {
+                var: "LH_LLM_MODEL_FAMILY + LH_LLM_CTX_TOKENS",
+                problem: "both are required to enable the LLM lane (set both or neither)"
+                    .to_string(),
+            });
+        }
+    };
+
+    let endpoint_kind = match std::env::var("LH_LLM_ENDPOINT_KIND") {
+        Ok(v) if !v.trim().is_empty() => {
+            LlmEndpointKind::parse(v.trim()).ok_or(ConfigError::BadEnv {
+                var: "LH_LLM_ENDPOINT_KIND",
+                problem: format!("{v:?} is not one of local-sidecar | custom-local | cloud"),
+            })?
+        }
+        _ => LlmEndpointKind::LocalSidecar,
+    };
+    let timeout_secs = std::env::var("LH_LLM_TIMEOUT_SEC")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_LLM_TIMEOUT_SECS);
+
+    Ok(Some(LlmConfig {
+        base_url: std::env::var("LH_LLM_BASE_URL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| DEFAULT_LLM_BASE_URL.to_string()),
+        api_key: std::env::var("LH_LLM_API_KEY")
+            .ok()
+            .filter(|s| !s.is_empty()),
+        model: std::env::var("LH_LLM_MODEL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| DEFAULT_LLM_MODEL.to_string()),
+        timeout_secs,
+        capability: LlmCapability {
+            model_family,
+            quant: std::env::var("LH_LLM_QUANT").ok().filter(|s| !s.is_empty()),
+            ctx_tokens,
+            endpoint_kind,
+        },
+    }))
+}
+
+fn env_nonempty(var: &'static str) -> Option<String> {
+    std::env::var(var)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 /// Where uploaded blobs go.
@@ -58,6 +162,8 @@ pub struct Config {
     pub brave_api_key: Option<String>,
     /// Per-request timeout for coordinator + source HTTP calls.
     pub http_timeout_secs: u64,
+    /// Local-LLM grading lane; None = no llm capability, no classify work.
+    pub llm: Option<LlmConfig>,
 }
 
 impl Config {
@@ -84,9 +190,8 @@ impl Config {
             Err(_) => 2,
         };
 
-        let work_dir = PathBuf::from(
-            std::env::var("LH_WORK_DIR").unwrap_or_else(|_| "./lh-work".to_string()),
-        );
+        let work_dir =
+            PathBuf::from(std::env::var("LH_WORK_DIR").unwrap_or_else(|_| "./lh-work".to_string()));
 
         let credentials = load_credentials(&work_dir)?;
 
@@ -113,12 +218,15 @@ impl Config {
         };
 
         let staging = staging_from_env(&work_dir)?;
-        let brave_api_key = std::env::var("LH_BRAVE_API_KEY").ok().filter(|s| !s.is_empty());
+        let brave_api_key = std::env::var("LH_BRAVE_API_KEY")
+            .ok()
+            .filter(|s| !s.is_empty());
         let http_timeout_secs = std::env::var("LH_HTTP_TIMEOUT_SEC")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
             .filter(|v| *v > 0)
             .unwrap_or(60);
+        let llm = llm_from_env()?;
 
         Ok(Config {
             coordinator_url,
@@ -130,6 +238,7 @@ impl Config {
             staging,
             brave_api_key,
             http_timeout_secs,
+            llm,
         })
     }
 
@@ -149,7 +258,10 @@ fn env_required(var: &'static str) -> Result<String, ConfigError> {
 fn validate_public_key(hex_str: &str) -> Result<(), String> {
     let bytes = hex::decode(hex_str).map_err(|e| format!("not hex: {e}"))?;
     if bytes.len() != 32 {
-        return Err(format!("expected 64 hex chars (32 bytes), got {}", bytes.len() * 2));
+        return Err(format!(
+            "expected 64 hex chars (32 bytes), got {}",
+            bytes.len() * 2
+        ));
     }
     Ok(())
 }
@@ -170,10 +282,11 @@ fn load_credentials(work_dir: &Path) -> Result<Option<Credentials>, ConfigError>
     let Ok(text) = fs::read_to_string(&path) else {
         return Ok(None);
     };
-    let creds: Credentials = serde_json::from_str(&text).map_err(|e| ConfigError::BadCredentials {
-        path,
-        problem: e.to_string(),
-    })?;
+    let creds: Credentials =
+        serde_json::from_str(&text).map_err(|e| ConfigError::BadCredentials {
+            path,
+            problem: e.to_string(),
+        })?;
     Ok(Some(creds))
 }
 
@@ -209,7 +322,9 @@ fn staging_from_env(work_dir: &Path) -> Result<StagingConfig, ConfigError> {
     }
     // 2. Direct R2 (S3 API) when bucket + keys are configured.
     let bucket = std::env::var("LH_R2_BUCKET").ok().filter(|s| !s.is_empty());
-    let ak = std::env::var("LH_R2_ACCESS_KEY_ID").ok().filter(|s| !s.is_empty());
+    let ak = std::env::var("LH_R2_ACCESS_KEY_ID")
+        .ok()
+        .filter(|s| !s.is_empty());
     let sk = std::env::var("LH_R2_SECRET_ACCESS_KEY")
         .ok()
         .filter(|s| !s.is_empty());
@@ -226,10 +341,7 @@ fn staging_from_env(work_dir: &Path) -> Result<StagingConfig, ConfigError> {
                         var: "LH_R2_ACCOUNT_ID (or LH_R2_ENDPOINT)",
                     });
                 }
-                format!(
-                    "https://{}.r2.cloudflarestorage.com",
-                    account.trim()
-                )
+                format!("https://{}.r2.cloudflarestorage.com", account.trim())
             }
         };
         return Ok(StagingConfig::R2 {

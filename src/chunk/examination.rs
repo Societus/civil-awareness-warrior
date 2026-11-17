@@ -50,7 +50,11 @@ pub(crate) async fn execute(
                 if registry.is_empty() {
                     "none".to_string()
                 } else {
-                    registry.keys().map(|s| s.to_string()).collect::<Vec<_>>().join(",")
+                    registry
+                        .keys()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
                 }
             ),
         ));
@@ -74,9 +78,7 @@ pub(crate) async fn execute(
     manifest
         .extra
         .insert("parser_id".into(), serde_json::json!(payload.parser_id));
-    manifest
-        .extra
-        .insert("measurements".into(), measurements);
+    manifest.extra.insert("measurements".into(), measurements);
     manifest.staged_features_blob = Some(payload.staged_blob_key.clone());
 
     Ok(Outcome {

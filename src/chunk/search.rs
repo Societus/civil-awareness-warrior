@@ -132,30 +132,44 @@ pub(crate) async fn execute(
             ));
         }
         let parsed = url::Url::parse(&url).map_err(|e| {
-            ChunkFailure::new(FailureType::SchemaDrift, format!("bad query url {url:?}: {e}"))
+            ChunkFailure::new(
+                FailureType::SchemaDrift,
+                format!("bad query url {url:?}: {e}"),
+            )
         })?;
         let mut req = ctx.http.get(parsed);
         for (k, v) in &headers {
             req = req.header(k, v);
         }
         req = req.header(reqwest::header::USER_AGENT, &ctx.user_agent);
-        let resp = req.send().await.map_err(|e| super::failure_for_transport(&e, &url))?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| super::failure_for_transport(&e, &url))?;
         let status = resp.status().as_u16();
         if !(200..300).contains(&status) {
             return Err(super::failure_for_status(status, &url));
         }
-        let body = resp.bytes().await.map_err(|e| super::failure_for_transport(&e, &url))?.to_vec();
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| super::failure_for_transport(&e, &url))?
+            .to_vec();
         ctx.limiter.record_bytes(body.len() as u64).await;
 
         hashes.push(hex::encode(Sha256::digest(&body)));
         let blob = put_zstd(&*ctx.stager, prefix, &format!("responses/{i:04}"), &body)
             .await
             .map_err(|e| {
-                ChunkFailure::new(FailureType::ClientError, format!("staging response failed: {e}"))
+                ChunkFailure::new(
+                    FailureType::ClientError,
+                    format!("staging response failed: {e}"),
+                )
             })?;
         evidence_keys.push(blob.key.clone());
 
-        let parsed_body: serde_json::Value = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+        let parsed_body: serde_json::Value =
+            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
         let mut urls = Vec::new();
         harvest_urls(&parsed_body, &mut urls);
         urls.truncate(spec.max_results as usize);
@@ -178,9 +192,10 @@ pub(crate) async fn execute(
     manifest
         .extra
         .insert("blob_encoding".into(), serde_json::json!("zstd"));
-    manifest
-        .extra
-        .insert("source_class_priority".into(), serde_json::json!(payload.source_class_priority));
+    manifest.extra.insert(
+        "source_class_priority".into(),
+        serde_json::json!(payload.source_class_priority),
+    );
     manifest
         .extra
         .insert("queries".into(), serde_json::Value::Array(per_query));
@@ -226,6 +241,9 @@ mod tests {
 
     #[test]
     fn encodes_queries() {
-        assert_eq!(encode_query("municode WI § zoning"), "municode+WI+%C2%A7+zoning");
+        assert_eq!(
+            encode_query("municode WI § zoning"),
+            "municode+WI+%C2%A7+zoning"
+        );
     }
 }
