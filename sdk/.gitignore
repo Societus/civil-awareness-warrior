@@ -1,0 +1,5 @@
+/target
+lh-work/
+lh-staging/
+.hermes/
+*.zst
