@@ -144,6 +144,9 @@ fn main() {
             contributor::download_local_model,
             contributor::delete_local_model,
             contributor::check_local_model,
+            contributor::check_binary_update,
+            contributor::install_binary_update,
+            contributor::remove_installed_binary,
             hardware::check_hardware,
             contributor::quit_app
         ])

@@ -247,6 +247,10 @@ export function demoLlmView(s) {
 		endpoint_is_cloud:
 			lm.mode === 'custom' && lm.endpoint !== '' && !isLocalEndpoint(lm.endpoint),
 		binary_found: lm.mode !== 'auto',
+		binary_version: null,
+		binary_backend: null,
+		binary_tag: null,
+		binary_fetch_supported: true,
 		api_key_present: false,
 		reused_external_server: false,
 		sidecar_running: false

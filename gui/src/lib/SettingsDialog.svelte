@@ -317,6 +317,10 @@
 		setTimeout(() => document.getElementById('lm-endpoint-c')?.focus(), 0);
 	}
 
+	/** Result of check_binary_update (backend shape), null until asked. */
+	/** @type {{installed: boolean, current_tag: string, latest_tag: string, latest_asset: string, latest_bytes: number, update_available: boolean, backend: string, override_set: boolean} | null} */
+	let binaryUpdate = $state(null);
+
 	const lmStatusText = $derived.by(() => {
 		switch (llm?.status) {
 			case 'model_missing':
@@ -327,8 +331,12 @@
 				return 'download failed';
 			case 'model_ready':
 				return 'ready on disk — Start boots the sidecar';
+			case 'binary_downloading':
+				return `fetching the pinned llama.cpp release… ${llm?.progress?.percent ?? 0}%`;
 			case 'binary_missing':
-				return 'model ready — llama-server not found (install llama.cpp, set its path below, or switch to Custom endpoint)';
+				return llm?.binary_fetch_supported === false
+					? 'model ready — no llama-server found, and this OS/arch is outside the auto-install matrix: install llama.cpp yourself, set its path below, or switch to Custom endpoint'
+					: 'model ready — no llama-server yet; Start fetches the pinned llama.cpp build automatically (sha256-verified before use)';
 			case 'starting':
 				return 'starting sidecar…';
 			case 'ready':
@@ -359,6 +367,41 @@
 		} finally {
 			busy = false;
 		}
+	}
+
+	/** Ask the backend to re-resolve upstream llama.cpp releases and compare
+	 *  with what is installed. Reports only — installs nothing. */
+	async function checkBinaryUpdates() {
+		if (!inTauri) {
+			note = 'binary update check is only available in the real app.';
+			return;
+		}
+		busy = true;
+		note = '';
+		errors = {};
+		try {
+			/** @type {{installed: boolean, current_tag: string, latest_tag: string, latest_asset: string, latest_bytes: number, update_available: boolean, backend: string, override_set: boolean}} */
+			const res = await invoke('check_binary_update');
+			binaryUpdate = res;
+			note = res.update_available
+				? `llama.cpp ${res.latest_tag} is available (${res.backend} build, ${fmtBytes(res.latest_bytes)}). You ${res.installed ? `run ${res.current_tag}` : `have nothing installed yet — the pinned default is ${res.current_tag}`}.${res.override_set ? ' Note: a llama-server path override is set, so what actually runs stays yours until you clear it.' : ''}`
+				: `no newer release than ${res.installed ? `installed ${res.current_tag}` : `the pinned default ${res.current_tag}`}.`;
+		} catch (e) {
+			binaryUpdate = null;
+			errors = toFieldErrors(e);
+		} finally {
+			busy = false;
+		}
+	}
+
+	async function installBinaryUpdate() {
+		await lmAction('install_binary_update', 'Binary update');
+		binaryUpdate = null;
+	}
+
+	async function removeInstalledBinary() {
+		await lmAction('remove_installed_binary', 'Remove llama-server');
+		binaryUpdate = null;
 	}
 </script>
 
@@ -585,30 +628,62 @@
 							<span>Status</span>
 							<b>{lmStatusText}</b>
 						</div>
+						{#if llm?.binary_version}
+							<div class="meta-row">
+								<span>llama-server</span>
+								<b>
+									{llm.binary_version}
+									{llm.binary_tag
+										? `— installed ${llm.binary_tag} (${llm.binary_backend ?? 'local'} build under the app data dir)`
+										: '— from your own install (override/PATH)'}
+								</b>
+							</div>
+						{:else if !llm?.binary_found}
+							<div class="meta-row">
+								<span>llama-server</span>
+								<b>{llm?.binary_fetch_supported === false
+										? 'not found — this OS/arch needs a manual install (see path override below)'
+										: 'not installed yet — Start fetches the pinned llama.cpp build for you'}</b>
+							</div>
+						{/if}
 						{#if llm?.model_bytes_on_disk}
 							<div class="meta-row">
 								<span>on disk</span>
 								<b>{fmtBytes(llm.model_bytes_on_disk)}</b>
 							</div>
 						{/if}
-					</div>
-					{#if llm?.progress}
+						</div>
+						{#if llm?.progress}
 						<div class="meta-row lm-progress">
-							<span>download</span>
+							<span>{llm.status === 'binary_downloading' ? 'llama-server download' : 'download'}</span>
 							<b>
 								<progress max={llm.progress.total_bytes || 1} value={llm.progress.done_bytes}></progress>
 								{llm.progress.percent}%
 							</b>
 						</div>
-					{/if}
-					{#if llm?.detail}
+						{/if}
+						{#if llm?.detail}
 						<p class="fine lm-detail">{llm.detail}</p>
-					{/if}
-					<div class="settings-actions">
+						{/if}
+						<div class="settings-actions">
 						<button onclick={() => lmAction('download_local_model', 'Model download')} disabled={busy}>Download model</button>
 						<button onclick={() => lmAction('check_local_model', 'Endpoint check')} disabled={busy}>Check now</button>
 						<button class="danger" onclick={() => lmAction('delete_local_model', 'Free disk')} disabled={busy}>Free disk</button>
-					</div>
+						</div>
+						<div class="settings-actions">
+						<button onclick={checkBinaryUpdates} disabled={busy}>Check for binary updates</button>
+						{#if binaryUpdate?.update_available}
+							<button onclick={installBinaryUpdate} disabled={busy}>Install llama.cpp {binaryUpdate.latest_tag}</button>
+						{/if}
+						{#if llm?.binary_tag}
+							<button class="danger" onclick={removeInstalledBinary} disabled={busy}>Remove llama-server</button>
+						{/if}
+						</div>
+						<p class="fine">
+						Auto-configure fetches the pinned llama.cpp release itself (sha256-verified against the release digest,
+						self-checked before install; Vulkan build when the hardware check sees a GPU). Nothing auto-updates:
+						"Check for binary updates" only tells you what upstream has, and installing it is a separate press.
+						</p>
 					<div>
 						<label for="lm-endpoint">Endpoint override (optional)</label>
 						<input

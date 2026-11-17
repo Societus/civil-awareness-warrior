@@ -501,18 +501,77 @@ impl AppState {
                     lane.spawned_by_us = false;
                     return Ok(self.build_llm_config());
                 }
-                // 4. Binary resolvable?
-                if sidecar::resolve_binary(&lm.llama_server_bin).is_none() {
-                    let msg = if !lm.llama_server_bin.trim().is_empty() {
-                        format!(
-                            "llama-server override {:#?} is not a file — fix the path under Settings ▸ Local Model ▸ Advanced, clear it to search PATH, or switch the mode to Custom endpoint",
-                            lm.llama_server_bin.trim()
-                        )
-                    } else {
-                        "no llama-server binary found on PATH — install llama.cpp, point Settings ▸ Local Model ▸ Advanced at your binary, or switch the Local Model mode to Custom endpoint".to_string()
-                    };
+                // 4. Binary resolvable? Resolution order: user override >
+                // verified app download > PATH. Auto-configure never makes
+                // the volunteer install llama.cpp by hand: when nothing
+                // resolves, the app self-acquires the pinned llama.cpp
+                // release for this box (sha256-verified before use,
+                // `--version`-self-checked in staging before anything is
+                // installed under bin/).
+                let override_set = !lm.llama_server_bin.trim().is_empty();
+                let mut bin = sidecar::resolve_binary(&lm.llama_server_bin, &self.data_dir);
+                if bin.is_none() && override_set {
+                    // A deliberately set override is honored strictly — a
+                    // broken override is an error, never a silent fallthrough
+                    // to an app-managed binary the user opted out of.
+                    let msg = format!(
+                        "llama-server override {:#?} is not a file — fix the path under Settings ▸ Local Model ▸ Advanced, or clear it and Auto-configure will fetch the pinned llama.cpp release for you",
+                        lm.llama_server_bin.trim()
+                    );
                     self.set_lane(LaneStatus::BinaryMissing, Some(msg.clone()));
                     return Err(msg);
+                }
+                if bin.is_none() {
+                    let resolved = match sidecar::select_pin_spec(self.auto_backend()) {
+                        Ok(spec) => sidecar::ResolvedBinary::from_pin(spec),
+                        Err(e) => {
+                            self.set_lane(LaneStatus::BinaryMissing, Some(e.clone()));
+                            return Err(e);
+                        }
+                    };
+                    self.set_lane(
+                        LaneStatus::BinaryDownloading,
+                        Some(format!(
+                            "fetching llama.cpp {} for this machine ({} · {} MB) — verified against its pinned sha256 and self-checked before install",
+                            resolved.tag, resolved.asset, resolved.bytes_hint / 1_000_000
+                        )),
+                    );
+                    match sidecar::download_binary(&self.data_dir, &resolved, |p| {
+                        let mut lane = guard(&self.lane);
+                        lane.progress = Some((p.done, p.total));
+                    })
+                    .await
+                    {
+                        Ok(version) => {
+                            let mut lane = guard(&self.lane);
+                            lane.progress = None;
+                            lane.binary_version = Some(version.clone());
+                            lane.binary_backend = Some(resolved.backend);
+                            lane.binary_tag = Some(resolved.tag.clone());
+                            eprintln!("acquired llama-server {} ({}): {version}", resolved.tag, resolved.backend);
+                            bin = sidecar::resolve_binary(&lm.llama_server_bin, &self.data_dir);
+                        }
+                        Err(e) => {
+                            let mut lane = guard(&self.lane);
+                            lane.progress = None;
+                            lane.detail = Some(e.clone());
+                            drop(lane);
+                            self.set_lane(LaneStatus::BinaryMissing, Some(e.clone()));
+                            return Err(e);
+                        }
+                    }
+                    if bin.is_none() {
+                        let msg = "the download verified and installed, but the binary no longer resolves — check Settings ▸ Local Model ▸ Advanced override".to_string();
+                        self.set_lane(LaneStatus::BinaryMissing, Some(msg.clone()));
+                        return Err(msg);
+                    }
+                }
+                // Capture the version of whatever we will actually run
+                // (override/PATH binaries included) so Settings can show it.
+                if guard(&self.lane).binary_version.is_none() {
+                    if let Some(v) = bin.as_ref().and_then(|p| sidecar::capture_version(p)) {
+                        guard(&self.lane).binary_version = Some(v);
+                    }
                 }
                 // 5. Spawn ours with the cap flags; health budget is hard.
                 let stale = guard(&self.sidecar).take();
@@ -562,6 +621,17 @@ impl AppState {
                     }
                 }
             }
+        }
+    }
+
+    /// Matrix backend pick from the hardware advisor's knowledge: the
+    /// Vulkan build only for a measured dedicated GPU; CPU otherwise. An
+    /// inconclusive probe never buys a confident Vulkan pick.
+    fn auto_backend(&self) -> sidecar::BinBackend {
+        use crate::hardware::SystemProbe;
+        match crate::hardware::RealSystemProbe.probe().gpu {
+            crate::hardware::GpuReading::Detected { .. } => sidecar::BinBackend::Vulkan,
+            _ => sidecar::BinBackend::Cpu,
         }
     }
 
@@ -971,6 +1041,7 @@ async fn sidecar_monitor(st: &Arc<AppState>) {
                 | LaneStatus::ModelMissing
                 | LaneStatus::ModelError
                 | LaneStatus::BinaryMissing
+                | LaneStatus::BinaryDownloading
                 | LaneStatus::Downloading
                 | LaneStatus::Starting => return,
                 LaneStatus::Ready | LaneStatus::ModelReady | LaneStatus::Unhealthy => {}
@@ -1105,7 +1176,43 @@ fn llm_view(st: &AppState) -> LlmView {
             && sidecar::custom_endpoint_kind(&sidecar::resolved_endpoint(&lm))
                 == LlmEndpointKind::Cloud,
         binary_found: lm.mode != LlmMode::Auto
-            || sidecar::resolve_binary(&lm.llama_server_bin).is_some(),
+            || sidecar::resolve_binary(&lm.llama_server_bin, &st.data_dir).is_some(),
+        // Which llama-server the lane resolved (or will run): the version
+        // line +, for an app-installed binary, its llama.cpp tag and
+        // backend flavor. Across restarts the version survives in the bin
+        // download state even before any spawn has happened.
+        binary_version: lane.binary_version.clone().or_else(|| {
+            if lm.mode == LlmMode::Auto {
+                sidecar::load_bin_state(&st.data_dir)
+                    .filter(|s| s.finished)
+                    .and_then(|s| s.version)
+            } else {
+                None
+            }
+        }),
+        binary_backend: lane.binary_backend.map(str::to_string).or_else(|| {
+            if lm.mode == LlmMode::Auto {
+                sidecar::load_bin_state(&st.data_dir)
+                    .filter(|s| s.finished)
+                    .map(|s| s.backend)
+            } else {
+                None
+            }
+        }),
+        binary_tag: lane.binary_tag.clone().or_else(|| {
+            if lm.mode == LlmMode::Auto {
+                sidecar::load_bin_state(&st.data_dir)
+                    .filter(|s| s.finished)
+                    .map(|s| s.tag)
+            } else {
+                None
+            }
+        }),
+        // Auto mode self-acquires the pinned llama.cpp release at Start —
+        // but only for hosts on the acquisition matrix. On an off-matrix
+        // box (e.g. linux aarch64) the UI must say "install it yourself",
+        // not promise a fetch that will fail.
+        binary_fetch_supported: lm.mode != LlmMode::Auto || sidecar::host_on_matrix(),
         api_key_present: settings::read_llm_key(&st.data_dir).is_some(),
         reused_external_server: lane.status == LaneStatus::Ready
             && !lane.spawned_by_us
@@ -1284,7 +1391,7 @@ pub struct LlmProgressOut {
 pub struct LlmView {
     pub mode: &'static str,
     /// off | model_missing | downloading | model_error | model_ready |
-    /// binary_missing | starting | ready | unhealthy
+    /// binary_missing | binary_downloading | starting | ready | unhealthy
     pub status: &'static str,
     pub detail: Option<String>,
     pub progress: Option<LlmProgressOut>,
@@ -1298,8 +1405,22 @@ pub struct LlmView {
     /// Custom mode pointing at a non-local host → the UI shows its
     /// disclosure line ("search snippets transit this provider").
     pub endpoint_is_cloud: bool,
-    /// Auto mode: a llama-server binary is locatable.
+    /// Auto mode: a llama-server binary is locatable (override, app
+    /// download, or PATH — Auto mode self-acquires at Start when not).
     pub binary_found: bool,
+    /// `llama-server --version` first line of the binary this app runs —
+    /// captured at first spawn; for an app-installed binary it also
+    /// survives restarts via the download state. null when unknown.
+    pub binary_version: Option<String>,
+    /// App-installed flavor: "cpu" | "vulkan" | "native". null when the
+    /// binary came from override/PATH.
+    pub binary_backend: Option<String>,
+    /// llama.cpp release tag the app installed (bin/). null for
+    /// override/PATH-sourced binaries.
+    pub binary_tag: Option<String>,
+    /// Auto mode can self-acquire the pinned llama.cpp release on this
+    /// box (host on the linux-x64 / windows-x64 / macos-arm64 matrix).
+    pub binary_fetch_supported: bool,
     /// A stored key exists (its value is NEVER sent to the webview).
     pub api_key_present: bool,
     /// The healthy endpoint is a server the volunteer already runs —
@@ -1868,6 +1989,155 @@ pub async fn check_local_model(app: AppHandle) -> Result<String, String> {
         )),
         Ok(None) => Err("the Local Model mode changed mid-check — press Check again".to_string()),
         Err(e) => Err(e),
+    }
+}
+
+/// What "Check for binary updates" reports — the comparison between the
+/// installed bin/ build (or the app's pin when nothing is installed) and
+/// what upstream llama.cpp's release chain resolves to today. Carries no
+/// secrets; installs NOTHING by itself.
+#[derive(Serialize)]
+pub struct BinaryUpdateOut {
+    /// True when the app has a verified llama-server under bin/.
+    pub installed: bool,
+    /// Tag the app would run today (installed tag, else the pin).
+    pub current_tag: String,
+    pub latest_tag: String,
+    pub latest_asset: String,
+    pub latest_bytes: u64,
+    /// Strictly newer conforming build than `current_tag`.
+    pub update_available: bool,
+    /// Matrix backend the resolution used ("cpu" | "vulkan" | "native").
+    pub backend: String,
+    /// A set Advanced override wins resolution even after an update —
+    /// surfaced so the UI can say "an override is set; updates won't
+    /// affect what runs until you clear it".
+    pub override_set: bool,
+}
+
+/// Re-resolve the upstream llama.cpp release chain (marker release →
+/// nightly pointer → assets, GitHub-verified digests) and compare against
+/// what the app has installed. NEVER switches anything on its own — the
+/// user must press install_binary_update. The pinned default stays default.
+#[tauri::command]
+pub async fn check_binary_update(app: AppHandle) -> Result<BinaryUpdateOut, String> {
+    let st = app.state::<Arc<AppState>>();
+    let lm = st.settings_snapshot().local_model;
+    let backend = st.auto_backend();
+    let spec = sidecar::select_pin_spec(backend)?;
+    let latest = sidecar::resolve_latest_binary(sidecar::GGML_RELEASES_API, backend).await?;
+    let installed = sidecar::load_bin_state(&st.data_dir).filter(|s| s.finished);
+    let current_tag = installed
+        .as_ref()
+        .map(|s| s.tag.clone())
+        .unwrap_or_else(|| spec.tag.to_string());
+    let update_available = match (sidecar::build_number(&latest.tag), sidecar::build_number(&current_tag)) {
+        (Some(a), Some(b)) => a > b,
+        // Non-conforming tags are never auto-compared — stay honest.
+        _ => false,
+    };
+    Ok(BinaryUpdateOut {
+        installed: installed.is_some(),
+        current_tag,
+        latest_tag: latest.tag,
+        latest_asset: latest.asset,
+        latest_bytes: latest.bytes_hint,
+        update_available,
+        backend: spec.backend_label.to_string(),
+        override_set: !lm.llama_server_bin.trim().is_empty(),
+    })
+}
+
+/// EXPLICIT user action following check_binary_update: download the current
+/// upstream release, verify it against GitHub's own digest, self-check it,
+/// and only then promote it into bin/. The old verified install stays
+/// intact-and-trusted if anything fails. The app never runs this by itself.
+#[tauri::command]
+pub async fn install_binary_update(app: AppHandle) -> Result<String, String> {
+    let st = app.state::<Arc<AppState>>();
+    let backend = st.auto_backend();
+    sidecar::select_pin_spec(backend)?; // this box is on the matrix at all
+    let latest = sidecar::resolve_latest_binary(sidecar::GGML_RELEASES_API, backend).await?;
+    if let Some(s) = sidecar::load_bin_state(&st.data_dir).filter(|s| s.finished) {
+        if s.tag == latest.tag {
+            return Ok(format!("{} is already installed — nothing to do", s.tag));
+        }
+    }
+    st.set_lane(
+        LaneStatus::BinaryDownloading,
+        Some(format!(
+            "installing llama.cpp {} — verifying {} against GitHub's digest before use",
+            latest.tag, latest.asset
+        )),
+    );
+    let result = sidecar::download_binary(&st.data_dir, &latest, |p| {
+        let mut lane = guard(&st.lane);
+        lane.progress = Some((p.done, p.total));
+    })
+    .await;
+    match result {
+        Ok(version) => {
+            let mut lane = guard(&st.lane);
+            lane.progress = None;
+            lane.binary_version = Some(version.clone());
+            lane.binary_backend = Some(latest.backend);
+            lane.binary_tag = Some(latest.tag.clone());
+            lane.detail = None;
+            Ok(format!("installed llama.cpp {} — {}", latest.tag, version))
+        }
+        Err(e) => {
+            // download_binary already restored the prior trust record (if a
+            // different build was installed and verified, it is intact).
+            let mut lane = guard(&st.lane);
+            lane.progress = None;
+            if sidecar::trusted_binary(&st.data_dir).is_some() {
+                lane.status = LaneStatus::BinaryMissing;
+                lane.detail = Some(format!(
+                    "the update to {} failed: {e} — the previously installed build is still in place and trusted",
+                    latest.tag
+                ));
+                // status name says "missing" for lane plumbing; the detail
+                // says plainly that a working build remains.
+            } else {
+                lane.status = LaneStatus::BinaryMissing;
+                lane.detail = Some(e.clone());
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Explicitly remove the app-installed llama-server: the whole bin/ tree
+/// (binary, companion libs, download state). A model file is NEVER touched,
+/// and an override/PATH-sourced binary the volunteer installed themselves
+/// stays exactly where it is. The pinned build is re-fetched (verified, as
+/// always) on the next Start if Auto mode needs it again.
+#[tauri::command]
+pub fn remove_installed_binary(app: AppHandle) -> Result<String, String> {
+    let st = app.state::<Arc<AppState>>();
+    if st.sidecar_child_alive() {
+        return Err(
+            "the local model sidecar is still running — Pause/stop it first, then remove the installed binary"
+                .to_string(),
+        );
+    }
+    let was_installed = sidecar::trusted_binary(&st.data_dir).is_some()
+        || sidecar::load_bin_state(&st.data_dir).is_some();
+    let freed = sidecar::delete_binary(&st.data_dir);
+    {
+        let mut lane = guard(&st.lane);
+        lane.binary_version = None;
+        lane.binary_backend = None;
+        lane.binary_tag = None;
+        lane.progress = None;
+    }
+    if was_installed {
+        Ok(format!(
+            "removed the app-installed llama-server ({} MB freed) — Auto mode will re-fetch the pinned build at the next Start",
+            freed / 1_000_000
+        ))
+    } else {
+        Ok("no app-installed llama-server to remove — nothing under bin/".to_string())
     }
 }
 
