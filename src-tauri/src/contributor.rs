@@ -402,6 +402,10 @@ impl AppState {
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
             http_timeout_secs: 60,
+            // LLM grading lane: not configured in the GUI yet — the Local
+            // Model card (sidecar task) wires this from Settings. None means
+            // the tracker never leases classify chunks to this client.
+            llm: None,
         };
         Ok((cfg, s.dry_run))
     }

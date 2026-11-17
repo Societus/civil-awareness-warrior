@@ -103,7 +103,11 @@ impl Capabilities {
                 Some(ChunkType::AltSource) => c.alt_source = true,
                 Some(ChunkType::StateWalk) => c.state_walk = true,
                 Some(ChunkType::Search) => c.search = true,
-                None => return None,
+                // classify exists in the SDK but has no toggle in this build
+                // yet (the Local Model card adds it). Treat it as unknown so
+                // a stale/future capabilities string fails loudly instead of
+                // silently enabling work this GUI cannot execute.
+                Some(ChunkType::Classify) | None => return None,
             }
             seen = true;
         }
