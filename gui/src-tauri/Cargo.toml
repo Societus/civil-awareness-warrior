@@ -1,0 +1,45 @@
+[package]
+name = "lh-contributor-gui"
+version = "0.1.0"
+edition = "2021"
+description = "Tauri 2 graphical wrapper for the LandHunter contributor client (tray app driving lh-contributor-client's run loop)."
+license = "MIT"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+lh-contributor-client = { path = "../../lh-contributor-client" }
+tauri = { version = "2", features = ["tray-icon"] }
+# /public/stats.json poll (CORS blocks the webview; the Rust side fetches).
+# Same version/features as the client lib so cargo reuses one compiled reqwest;
+# `stream` added for the sidecar model download (bytes_stream) — feature
+# unification means the client lib shares the same single compiled reqwest.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "stream"] }
+# Run-window schedule checks against the LOCAL wall clock. chrono already
+# compiles in this tree (serde_with ← tauri), so this is a zero-cost re-export.
+chrono = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["sync", "time"] }
+# Local Model sidecar (t_3067589d): url/sha2/futures-util already compile in
+# this tree via reqwest + the client lib; libc via tauri's deps. Direct deps
+# so the sidecar code can import them (same zero-cost precedent as chrono).
+url = "2"
+sha2 = "0.10"
+futures-util = "0.3"
+libc = "0.2"
+# "Can I AI?" advisor links (t_10daf382): the hardware report carries the
+# operator-designated HF repo link; the opener plugin launches it in the
+# SYSTEM browser, and capabilities/default.json scopes that permission to
+# huggingface.co only. (Tauri 2 core has no link-opening command.)
+tauri-plugin-opener = "2"
+tauri-plugin-autostart = "2"
+
+[target.'cfg(windows)'.dependencies]
+# "Can I AI?" Windows probe half: DXGI DedicatedVideoMemory + GlobalMemoryStatusEx.
+# Same windows version tauri already pins in Cargo.lock (0.62.2) — cargo
+# unifies to one compiled crate; the features only gate what THIS crate's
+# windows code may name. Deliberately NOT Win32_Media_Audio / UI halves, and
+# never Win32_Graphics_Dxgi_Constants beyond what EnumAdapters/GetDesc1 need.
+windows = { version = "0.62", features = ["Win32_Graphics_Dxgi", "Win32_System_SystemInformation"] }

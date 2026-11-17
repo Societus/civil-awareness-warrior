@@ -1,0 +1,163 @@
+# Release pipeline for the LandHunter contributor GUI (card t_f9279e25).
+#
+# Trigger: a tag push matching v* (or a manual dispatch — see README
+# "Releasing" for what each does). One build per OS on GitHub-hosted
+# runners; all artifacts are attached to a GitHub Release named after the
+# tag. Nothing is signed/notarized here — that is a deliberate later
+# operator step (README documents how to bolt it on).
+#
+# Layout requirement: src-tauri/Cargo.toml embeds the SDK as a PATH
+# dependency at ../../lh-contributor-client — the same sibling-repo layout
+# the dev boxes use. This workflow therefore checks BOTH repos out into
+# sibling subdirectories of the runner workspace:
+#
+#   $GITHUB_WORKSPACE/lh-contributor-gui/        <- this repo
+#   $GITHUB_WORKSPACE/lh-contributor-client/     <- the SDK
+#
+# so that from src-tauri/, ../.. resolves to the workspace root and the
+# path dep compiles. The SDK is assumed to live in THIS repo's org under
+# the name lh-contributor-client; if you park it elsewhere, edit the
+# `repository:` line. If the SDK repo is private, store a read-only token
+# for it as the repository secret LH_CONTRIBUTOR_CLIENT_TOKEN.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      prerelease:
+        description: Publish the GitHub Release marked as a prerelease
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux
+            os: ubuntu-24.04
+            bundles: deb,appimage
+            tauri_extra: ""
+            rust_targets: ""
+          - name: windows
+            os: windows-latest
+            bundles: nsis
+            tauri_extra: ""
+            rust_targets: ""
+          # arm64 + x86_64 in one universal binary (arm64 runner cross-
+          # builds the x86_64 slice; the dmg carries the universal .app).
+          - name: macos-universal
+            os: macos-14
+            bundles: dmg
+            tauri_extra: --target universal-apple-darwin
+            rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+        with:
+          path: lh-contributor-gui
+
+      - name: Checkout SDK (path dep at ../lh-contributor-client)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/lh-contributor-client
+          token: ${{ secrets.LH_CONTRIBUTOR_CLIENT_TOKEN || secrets.GITHUB_TOKEN }}
+          path: lh-contributor-client
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: lh-contributor-gui/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
+
+      - name: Linux system deps (webkit2gtk / tray / bundler tools)
+        if: matrix.name == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - name: npm ci
+        working-directory: lh-contributor-gui
+        run: npm ci
+
+      - name: Stamp the release version (tauri.conf.json is the source of truth)
+        working-directory: lh-contributor-gui
+        run: |
+          npm run sync-version
+          npm run verify-version
+
+      - name: Build bundles
+        working-directory: lh-contributor-gui
+        run: npx tauri build ${{ matrix.tauri_extra }} --bundles ${{ matrix.bundles }}
+
+      # Windows bonus artifact: the bare exe in a zip, for volunteers who
+      # want no installer. Needs the WebView2 runtime the OS already ships
+      # on Windows 10+ (the NSIS installer carries a bootstrapper for
+      # machines that somehow lack it). Fixed filename on purpose: a git
+      # tag name can contain shell metacharacters, so ${{ github.ref_name
+      # }} is deliberately NOT interpolated into the pwsh line.
+      - name: Portable zip (Windows)
+        if: matrix.name == 'windows'
+        working-directory: lh-contributor-gui
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path src-tauri/target/release/lh-contributor-gui.exe `
+            -DestinationPath dist/lh-contributor-gui-portable.zip
+
+      - name: Upload bundles for the release
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundles-${{ matrix.name }}
+          path: lh-contributor-gui/src-tauri/target/release/bundle/**
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload portable zip
+        if: matrix.name == 'windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundles-${{ matrix.name }}-portable
+          path: lh-contributor-gui/dist/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Collect every platform bundle
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bundles-*
+          merge-multiple: true
+          path: dist
+
+      - name: Publish the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: LandHunter Contributor ${{ github.ref_name }}
+          files: dist/**
+          prerelease: ${{ inputs.prerelease == true }}
+          generate_release_notes: true
