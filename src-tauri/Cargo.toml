@@ -34,6 +34,7 @@ libc = "0.2"
 # SYSTEM browser, and capabilities/default.json scopes that permission to
 # huggingface.co only. (Tauri 2 core has no link-opening command.)
 tauri-plugin-opener = "2"
+tauri-plugin-autostart = "2"
 
 [target.'cfg(windows)'.dependencies]
 # "Can I AI?" Windows probe half: DXGI DedicatedVideoMemory + GlobalMemoryStatusEx.

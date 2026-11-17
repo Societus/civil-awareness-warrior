@@ -65,6 +65,9 @@ function defaultSettings() {
 		dry_run: true,
 		capabilities: { examination: true, ingest: true, alt_source: true, state_walk: true, search: true },
 		schedule: { enabled: false, active_from: '09:00', active_until: '17:00' },
+		// Launch-at-login is an OS registration — the browser demo has no OS
+		// side, so it only mirrors the persisted intent shape.
+		autostart: false,
 		local_model: { ...LOCAL_MODEL_DEFAULT }
 	};
 }
@@ -116,6 +119,7 @@ export function demoSaveSettings(input) {
 	}
 	if (input?.concurrency != null) merged.concurrency = Number(input.concurrency);
 	if (input?.dry_run != null) merged.dry_run = Boolean(input.dry_run);
+	if (input?.autostart != null) merged.autostart = Boolean(input.autostart);
 	if (input?.capabilities) {
 		for (const k of CAP_KEYS) {
 			if (input.capabilities[k] != null) merged.capabilities[k] = Boolean(input.capabilities[k]);
@@ -155,6 +159,7 @@ function settingsView(s) {
 		dry_run: s.dry_run,
 		capabilities: s.capabilities,
 		schedule: s.schedule,
+		autostart: s.autostart ?? false,
 		staging_mode: s.dry_run
 			? 'staging: local (dry run)'
 			: 'staging: not configured (real runs will refuse to start)',

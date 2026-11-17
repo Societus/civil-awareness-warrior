@@ -1346,6 +1346,10 @@ pub struct SettingsView {
     pub dry_run: bool,
     pub capabilities: settings::Capabilities,
     pub schedule: settings::ScheduleCfg,
+    /// Launch-at-login intent as persisted. save_settings moves the OS
+    /// entry the moment this flips, and main.rs re-points it at every
+    /// startup, so the checkbox reflects what the next login will do.
+    pub autostart: bool,
     pub staging_mode: &'static str,
     pub public_key_configured: bool,
     /// Last 6 hex chars of the configured PUBLIC key (not a secret, but we
@@ -1416,6 +1420,9 @@ pub struct SettingsInput {
     pub capabilities: Option<CapabilitiesIn>,
     pub schedule: Option<ScheduleIn>,
     pub local_model: Option<LocalModelIn>,
+    /// Launch-at-login: Some replaces the stored intent (save_settings then
+    /// writes/removes the OS entry BEFORE persisting); None keeps it.
+    pub autostart: Option<bool>,
     /// Some replaces/deletes the stored API key (empty string = delete);
     /// None leaves it untouched. The value goes straight to
     /// llm_api_key.json (0600, same protection class as credentials.json) —
@@ -1467,6 +1474,12 @@ fn merge_settings(current: &GuiSettings, input: &SettingsInput) -> GuiSettings {
         if let Some(v) = &sched.active_until {
             s.schedule.active_until = v.trim().to_string();
         }
+    }
+    // Launch-at-login: absent keeps the stored intent (a dialog that never
+    // renders the control — or a partial save — must not touch it);
+    // present replaces it.
+    if let Some(a) = input.autostart {
+        s.autostart = a;
     }
     if let Some(lm) = &input.local_model {
         if let Some(m) = &lm.mode {
@@ -1538,6 +1551,7 @@ fn settings_view(st: &AppState) -> SettingsView {
         dry_run: s.dry_run,
         capabilities: s.capabilities.clone(),
         schedule: s.schedule.clone(),
+        autostart: s.autostart,
         staging_mode,
         public_key_configured: !key.is_empty(),
         public_key_tail: if key.len() >= 6 {
@@ -1858,6 +1872,25 @@ pub async fn check_local_model(app: AppHandle) -> Result<String, String> {
     }
 }
 
+/// Write/remove the OS launch-at-login entry through the autostart plugin
+/// (tauri-plugin-autostart 2): an HKCU Run-key value on Windows, an XDG
+/// autostart .desktop on Linux (AppImage path resolved by the plugin), a
+/// `~/Library/LaunchAgents` LaunchAgent on macOS. `disable()` is a no-op
+/// when the entry is already absent (the plugin maps the Windows
+/// "value not found" case). Every call is Rust-side — no webview
+/// permission needed, so capabilities/default.json stays untouched.
+fn apply_autostart(app: &AppHandle, enable: bool) -> Result<(), String> {
+    use tauri_plugin_autostart::ManagerExt;
+    let manager = app.autolaunch();
+    let r = if enable { manager.enable() } else { manager.disable() };
+    r.map_err(|e| {
+        format!(
+            "could not {} launch-at-login for this user: {e}",
+            if enable { "register" } else { "remove" }
+        )
+    })
+}
+
 #[tauri::command]
 pub fn get_settings_view(app: AppHandle) -> SettingsView {
     settings_view(&app.state::<Arc<AppState>>())
@@ -1881,6 +1914,14 @@ pub fn save_settings(
     if let Some(key) = &input.llm_api_key {
         settings::write_llm_key(&st.data_dir, Some(key))
             .map_err(|e| FieldError::new("llm_api_key", e))?;
+    }
+    // Launch-at-login intent changed: write the OS entry FIRST. If the OS
+    // write fails the save aborts before settings.json is touched, so the
+    // file can never advertise an autostart state the OS does not actually
+    // have (intent and Run key / autostart .desktop / LaunchAgent stay in
+    // lockstep by construction, not by luck).
+    if s.autostart != prev.autostart {
+        apply_autostart(&app, s.autostart).map_err(|e| FieldError::new("autostart", e))?;
     }
     *guard(&st.settings) = s.clone();
     settings::write(&st.data_dir, &s).map_err(|e| FieldError::new("settings_file", e))?;
@@ -2083,6 +2124,7 @@ mod tests {
             },
             schedule: ScheduleCfg::default(),
             local_model: settings::LocalModelCfg::default(),
+            autostart: false,
         };
         let input = SettingsInput {
             coordinator_url: None,
@@ -2102,6 +2144,7 @@ mod tests {
                 active_until: Some("06:00".to_string()),
             }),
             local_model: None,
+            autostart: None,
             llm_api_key: None,
         };
         let merged = merge_settings(&current, &input);
@@ -2129,6 +2172,7 @@ mod tests {
             dry_run: None,
             schedule: None,
             local_model: None,
+            autostart: None,
             llm_api_key: None,
         };
         let merged_off = merge_settings(&current, &off);
@@ -2145,6 +2189,7 @@ mod tests {
             capabilities: Capabilities::default(),
             schedule: ScheduleCfg::default(),
             local_model: settings::LocalModelCfg::default(),
+            autostart: false,
         };
         let input_for = |model_id: &str| SettingsInput {
             coordinator_url: None,
@@ -2163,6 +2208,7 @@ mod tests {
                 ctx_tokens: None,
             }),
             llm_api_key: None,
+            autostart: None,
         };
         // The 9B opt-in id survives the merge exactly.
         let merged = merge_settings(&base, &input_for(sidecar::LARGE_MODEL.id));
@@ -2201,9 +2247,42 @@ mod tests {
                 capabilities: None,
                 schedule: None,
                 llm_api_key: None,
+                autostart: None,
             },
         );
         assert_eq!(untouched.local_model.model_id, sidecar::LARGE_MODEL.id);
+    }
+
+    #[test]
+    fn merge_autostart_absent_keeps_intent_present_replaces_it() {
+        // An unrelated partial save (no autostart key) must leave the
+        // launch-at-login intent exactly as stored — the OS entry belongs
+        // to the human's checkbox, not to every settings write.
+        let base = GuiSettings {
+            coordinator_url: "https://coordinator.test".to_string(),
+            public_key_hex: String::new(),
+            concurrency: 2,
+            dry_run: true,
+            capabilities: Capabilities::default(),
+            schedule: ScheduleCfg::default(),
+            local_model: settings::LocalModelCfg::default(),
+            autostart: true,
+        };
+        let input = |autostart: Option<bool>| SettingsInput {
+            coordinator_url: None,
+            public_key_hex: None,
+            concurrency: None,
+            dry_run: None,
+            capabilities: None,
+            schedule: None,
+            local_model: None,
+            autostart,
+            llm_api_key: None,
+        };
+        assert!(merge_settings(&base, &input(None)).autostart, "absent keeps true");
+        assert!(!merge_settings(&base, &input(Some(false))).autostart);
+        let off_base = GuiSettings { autostart: false, ..base.clone() };
+        assert!(merge_settings(&off_base, &input(Some(true))).autostart);
     }
 
     /// Minimal HTTP coordinator stand-in (no external deps): /health,
@@ -2319,6 +2398,7 @@ mod tests {
             // Mode None → the lifecycle under test is the pre-change path:
             // no llm declaration, no sidecar, `Config.llm = None`.
             local_model: settings::LocalModelCfg::default(),
+            autostart: false,
         };
         let st = Arc::new(AppState::new(dir.clone(), settings, None));
 

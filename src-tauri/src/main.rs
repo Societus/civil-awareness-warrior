@@ -19,6 +19,16 @@ fn main() {
         // opener plugin; the capability scopes it to huggingface.co only
         // (capabilities/default.json). No other URL can be opened.
         .plugin(tauri_plugin_opener::init())
+        // Launch-at-login (card t_f9279e25): the plugin owns the OS entry —
+        // HKCU Run value (Windows), XDG autostart .desktop (Linux,
+        // AppImage-aware), ~/Library/LaunchAgents LaunchAgent (macOS; the
+        // README autostart section covers headless/console-login caveats).
+        // No args are passed to the autostarted launch; every call is
+        // Rust-side so no webview permission is added.
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec![]),
+        ))
         .setup(|app| {
             let handle = app.handle().clone();
 
@@ -27,6 +37,28 @@ fn main() {
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
             let settings = settings::load_or_create(&data_dir)?;
+
+            // Launch-at-login startup reconcile: re-apply the persisted
+            // intent on EVERY startup instead of trusting the OS entry as
+            // found. enable() re-points the entry at the binary actually
+            // running (a hand-deleted entry re-registers; a stale entry
+            // left by an older path/dev build is corrected); disable() is
+            // a cheap no-op when nothing is registered. Failures log and
+            // never trap the app — a session that refuses the entry write
+            // (headless macOS over ssh, §README) still runs fine when the
+            // human starts it.
+            {
+                use tauri_plugin_autostart::ManagerExt;
+                let manager = handle.autolaunch();
+                let r = if settings.autostart {
+                    manager.enable()
+                } else {
+                    manager.disable()
+                };
+                if let Err(e) = r {
+                    eprintln!("autostart startup reconcile failed: {e}");
+                }
+            }
             // AppState behind an Arc: background tasks and the lifecycle
             // tests share it; the tray handlers reach it via managed state.
             let state = Arc::new(contributor::AppState::new(

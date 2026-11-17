@@ -48,6 +48,9 @@
 				active_from: sc.active_from ?? '09:00',
 				active_until: sc.active_until ?? '17:00'
 			},
+			// Launch-at-login intent (the Rust side applies the OS entry on
+			// save and re-points it every startup — see README autostart).
+			autostart: v?.autostart ?? false,
 			local_model: {
 				mode: v?.local_model?.mode ?? 'none',
 				cap: v?.local_model?.cap ?? 'cpu_third',
@@ -130,6 +133,7 @@
 				active_from: draft.schedule.active_from,
 				active_until: draft.schedule.active_until
 			},
+			autostart: draft.autostart,
 			local_model: { ...draft.local_model },
 			// Key handling: sent ONLY when a new key was typed (replace) or
 			// Remove key was pressed ('' → backend deletes the stored file).
@@ -146,11 +150,12 @@
 				dry_run: next.dry_run,
 				capabilities: { ...next.capabilities },
 				schedule: { ...next.schedule },
+				autostart: next.autostart,
 				local_model: { ...next.local_model },
 				llm_api_key: ''
 			};
 			removeLlmKey = false;
-			note = 'Settings saved. Concurrency, capabilities and dry-run apply on the next start; the run window and the local-model lane are reconciled immediately (a live sidecar restarts with the new caps when needed).';
+			note = 'Settings saved. Concurrency, capabilities and dry-run apply on the next start; the run window, the launch-at-login entry and the local-model lane are reconciled immediately (a live sidecar restarts with the new caps when needed).';
 			await onChanged?.();
 		} catch (e) {
 			errors = toFieldErrors(e);
@@ -434,6 +439,22 @@
 			{/if}
 			{#if errors.schedule}
 				<p class="field-error" role="alert">{errors.schedule}</p>
+			{/if}
+		</section>
+
+		<section class="settings-section" aria-labelledby="autostart-title">
+			<h3 class="section-label" id="autostart-title">System</h3>
+			<div class="toggle-row">
+				<label for="autostart-enabled">Launch at login</label>
+				<input id="autostart-enabled" type="checkbox" bind:checked={draft.autostart} />
+			</div>
+			<p class="fine">
+				Registers this app for your user only (Windows: Run key entry · Linux: autostart entry ·
+				macOS: login LaunchAgent). Each launch re-points the entry at the app you last ran, so it
+				never points at a stale or old-path build.
+			</p>
+			{#if errors.autostart}
+				<p class="field-error" role="alert">{errors.autostart}</p>
 			{/if}
 		</section>
 

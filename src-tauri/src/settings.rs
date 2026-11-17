@@ -339,6 +339,19 @@ pub struct GuiSettings {
     pub schedule: ScheduleCfg,
     #[serde(default)]
     pub local_model: LocalModelCfg,
+    /// Launch-at-login INTENT (Settings checkbox → apply_autostart in
+    /// contributor.rs). The OS entry the autostart plugin writes: an HKCU
+    /// `Software\Microsoft\Windows\CurrentVersion\Run` value on Windows, a
+    /// `~/.config/autostart/<app>.desktop` on Linux (the plugin resolves
+    /// the AppImage path), a LaunchAgent plist under
+    /// `~/Library/LaunchAgents` on macOS. settings.json stores the human's
+    /// intent; save_settings applies OS changes immediately and main.rs
+    /// re-points the entry at the running binary on every startup, so the
+    /// entry and the installed app can never drift apart.
+    /// `serde(default)`: settings.json files written before this field
+    /// shipped keep autostart off.
+    #[serde(default)]
+    pub autostart: bool,
 }
 
 impl GuiSettings {
@@ -406,6 +419,10 @@ impl GuiSettings {
             capabilities,
             schedule: ScheduleCfg::default(),
             local_model,
+            // Launch-at-login is deliberately NOT env-seedable: registering
+            // a per-user OS login entry is a human action (the Settings
+            // checkbox), same doctrine as Auto model mode being UI-only.
+            autostart: false,
         };
         s.normalize_local_model();
         s
@@ -721,6 +738,9 @@ mod tests {
                 model_name: "qwen3:8b".to_string(),
                 ctx_tokens: 8192,
             },
+            // true on purpose: the roundtrip must prove the intent survives
+            // write → load, not just the off default.
+            autostart: true,
         };
         write(&dir, &s).expect("write settings");
         let loaded = load_or_create(&dir).expect("load");
@@ -738,6 +758,33 @@ mod tests {
             crate::sidecar::LARGE_MODEL.id,
             "a legitimate bundled id round-trips untouched"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn autostart_defaults_off_and_survives_legacy_files() {
+        // Fresh install: launch-at-login is OFF until a human ticks the
+        // checkbox — defaults_from_env carries no autostart env seed.
+        let dir = std::env::temp_dir().join("lhc-gui-autostart-test");
+        let _ = fs::remove_dir_all(&dir);
+        assert!(!GuiSettings::defaults_from_env().autostart);
+
+        // The persisted intent round-trips true.
+        let mut s = GuiSettings::defaults_from_env();
+        s.autostart = true;
+        write(&dir, &s).expect("write");
+        assert!(load_or_create(&dir).expect("load").autostart);
+
+        // settings.json from a pre-autostart build (field never stored)
+        // loads with the entry OFF via serde(default) — no load failure,
+        // no surprise enable.
+        fs::write(
+            settings_path(&dir),
+            r#"{"coordinator_url":"https://example.test","public_key_hex":"","concurrency":3,"dry_run":false}"#,
+        )
+        .expect("seed legacy");
+        let legacy = load_or_create(&dir).expect("load legacy");
+        assert!(!legacy.autostart);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -841,6 +888,7 @@ mod tests {
             capabilities: Capabilities::default(),
             schedule: ScheduleCfg::default(),
             local_model: LocalModelCfg::default(),
+            autostart: false,
         };
         assert!(base.clone().validate().is_ok());
 
@@ -949,6 +997,7 @@ mod tests {
             capabilities: Capabilities::default(),
             schedule: ScheduleCfg::default(),
             local_model: LocalModelCfg::default(),
+            autostart: false,
         };
 
         // Custom mode without an endpoint is refused.
