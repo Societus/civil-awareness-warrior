@@ -11,7 +11,9 @@
     "build": "vite build",
     "preview": "vite preview",
     "check": "svelte-kit sync && svelte-check --tsconfig ./jsconfig.json",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "sync-version": "node scripts/sync-version.mjs",
+    "verify-version": "node scripts/sync-version.mjs --verify"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.12.5"
