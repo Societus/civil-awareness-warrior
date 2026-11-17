@@ -64,6 +64,9 @@ header {
 	align-items: center;
 	justify-content: space-between;
 	gap: 8px;
+	/* at the compact 360 px window the status cluster drops to its own
+	   right-aligned line instead of crushing the title */
+	flex-wrap: wrap;
 }
 
 .brand {
@@ -207,7 +210,7 @@ h1 {
 
 .controls {
 	display: grid;
-	grid-template-columns: 1.2fr 1fr 1fr;
+	grid-template-columns: 1.4fr 1fr;
 	gap: 8px;
 }
 
@@ -300,7 +303,8 @@ label {
 
 input[type='text'],
 input[type='password'],
-input[type='number'] {
+input[type='number'],
+input[type='time'] {
 	font: inherit;
 	width: 100%;
 	padding: 6px 8px;
@@ -320,7 +324,7 @@ button:focus-visible {
 	font-size: 11px;
 	color: var(--muted);
 	margin: 4px 0 0;
-	word-break: break-all;
+	overflow-wrap: break-word;
 }
 
 footer {
@@ -406,4 +410,230 @@ footer {
 .demo-tag {
 	color: var(--warn);
 	font-weight: 600;
+}
+
+/* settings dialog (t_2b8170a8) */
+.icon-btn {
+	font-size: 14px;
+	line-height: 1;
+	padding: 5px 8px;
+	border-radius: 8px;
+	border: 1px solid var(--border-strong);
+	background: var(--panel);
+	color: var(--muted);
+	cursor: pointer;
+}
+
+.icon-btn:hover:not(:disabled) {
+	border-color: var(--muted);
+	color: var(--text);
+}
+
+.settings-overlay {
+	position: fixed;
+	inset: 0;
+	background: rgba(15, 23, 42, 0.5);
+	display: flex;
+	justify-content: center;
+	padding: 10px;
+	z-index: 10;
+}
+
+.scrim {
+	position: absolute;
+	inset: 0;
+	width: 100%;
+	height: 100%;
+	border: 0;
+	background: transparent;
+	padding: 0;
+	cursor: default;
+}
+
+.settings-panel {
+	position: relative;
+	z-index: 11;
+	width: 100%;
+	max-width: 340px;
+	max-height: 100%;
+	overflow-y: auto;
+	display: flex;
+	flex-direction: column;
+	gap: 12px;
+	background: var(--panel);
+	border: 1px solid var(--border-strong);
+	border-radius: 12px;
+	padding: 12px 14px;
+	box-shadow: 0 8px 24px rgba(15, 23, 42, 0.25);
+}
+
+.settings-panel:focus-visible {
+	outline: 2px solid var(--accent);
+	outline-offset: 1px;
+}
+
+.settings-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	position: sticky;
+	top: 0;
+	background: var(--panel);
+	padding: 2px 0 6px;
+	margin: -2px 0 -2px;
+	z-index: 1;
+}
+
+.settings-head h2 {
+	margin: 0;
+	font-size: 13px;
+	font-weight: 700;
+	letter-spacing: 0.01em;
+}
+
+.settings-section {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	border-top: 1px solid var(--border);
+	padding-top: 10px;
+}
+
+.settings-panel .section-label {
+	margin: 0;
+	font-size: 10px;
+	font-weight: 600;
+	letter-spacing: 0.08em;
+	text-transform: uppercase;
+	color: var(--muted);
+}
+
+.cap-list {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+}
+
+.cap-row {
+	display: grid;
+	grid-template-columns: auto 1fr;
+	gap: 3px 9px;
+	align-items: start;
+	border: 1px solid var(--border);
+	border-radius: 8px;
+	padding: 7px 9px;
+	background: var(--input-bg);
+	/* undo the global uppercase label treatment for these richer rows */
+	font: inherit;
+	font-size: 12.5px;
+	letter-spacing: 0;
+	text-transform: none;
+	color: var(--text);
+	margin: 0;
+	cursor: pointer;
+}
+
+.cap-row input[type='checkbox'] {
+	accent-color: var(--accent);
+	width: 14px;
+	height: 14px;
+	margin-top: 2px;
+}
+
+.cap-text {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	min-width: 0;
+}
+
+.cap-text b {
+	font-weight: 650;
+}
+
+.cap-desc {
+	font-size: 11px;
+	color: var(--muted);
+	line-height: 1.35;
+}
+
+.concurrency-row {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+}
+
+.concurrency-row label {
+	margin: 0;
+	text-transform: none;
+	letter-spacing: 0;
+	font-size: 12.5px;
+	color: var(--text);
+	font-weight: 600;
+}
+
+.concurrency-row input[type='range'] {
+	flex: 1;
+	accent-color: var(--accent);
+}
+
+.conc-num {
+	font-size: 14px;
+	font-weight: 700;
+	font-variant-numeric: tabular-nums;
+	min-width: 2ch;
+	text-align: right;
+}
+
+.window-row {
+	display: grid;
+	grid-template-columns: 1fr 1fr;
+	gap: 8px;
+}
+
+.identity-box {
+	display: flex;
+	flex-direction: column;
+	gap: 5px;
+	border: 1px solid var(--border);
+	border-radius: 8px;
+	padding: 8px 10px;
+	background: var(--input-bg);
+}
+
+.identity-box .meta-row {
+	font-size: 12px;
+}
+
+.identity-box .meta-row b {
+	font-weight: 600;
+	word-break: break-all;
+	text-align: right;
+}
+
+.field-error {
+	color: var(--err);
+	font-size: 11.5px;
+	margin: 0;
+}
+
+.settings-actions {
+	display: grid;
+	grid-template-columns: 1fr 1fr;
+	gap: 8px;
+}
+
+button.danger.armed {
+	background: var(--err);
+	border-color: var(--err);
+	color: var(--accent-contrast);
+}
+
+.advanced-placeholder {
+	border: 1px dashed var(--border-strong);
+	border-radius: 8px;
+	padding: 8px 10px;
+	font-size: 11.5px;
+	color: var(--muted);
+	background: var(--input-bg);
 }

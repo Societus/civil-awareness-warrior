@@ -1,6 +1,15 @@
 <script>
 	import { invoke } from '@tauri-apps/api/core';
-	import { makeDemoStatus, makeDemoCommunity, makeDemoSettingsView } from '#lib/demo.js';
+	import { listen } from '@tauri-apps/api/event';
+	import SettingsDialog from '#lib/SettingsDialog.svelte';
+	import {
+		makeDemoStatus,
+		makeDemoCommunity,
+		makeDemoSettingsView,
+		demoSaveSettings,
+		demoStartContributor,
+		demoPauseContributor
+	} from '#lib/demo.js';
 
 	const inTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 	const demoStartedAtMs = Date.now();
@@ -14,13 +23,13 @@
 	let error = $state('');
 	let note = $state('');
 	let busy = $state(false);
-	/** Plain flag (NOT $state): seeding must not feed the polling effect's
-	 *  dependency graph. */
-	let settingsSeeded = false;
+	// ?settings in the URL opens the dialog on load — a dev affordance that
+	// lets headless-browser verification reach the dialog without clicking.
+	const openSettingsParam =
+		typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('settings');
+	let settingsOpen = $state(openSettingsParam);
 	/** Wall-clock anchor so the per-lease timers tick between polls. */
 	let now = $state(Date.now());
-
-	let form = $state({ coordinator_url: '', public_key_hex: '', concurrency: 2 });
 
 	/**
 	 * Per-lease elapsed tracking. The lib's stats handle carries no lease
@@ -52,12 +61,13 @@
 	/**
 	 * Pull the lib's stats handle via get_status (2 s tick, async invoke —
 	 * the UI thread never blocks). Outside Tauri the synthetic demo status
-	 * takes the same code path so the dashboard is previewable in a browser.
+	 * takes the same code path so the dashboard + settings are previewable
+	 * in a browser.
 	 *
 	 * IMPORTANT: results land in LOCAL variables before being written to
 	 * state, and all reads of them use the locals. Calling this synchronously
 	 * from the polling $effect would otherwise make the effect READ the same
-	 * state it WRITES (trackLeases(status), seed guard) → self-triggering →
+	 * state it WRITES (trackLeases(status)) → self-triggering →
 	 * effect_update_depth_exceeded. (In the Tauri branch the awaits untrack
 	 * the writes, but the demo branch has none.)
 	 */
@@ -83,13 +93,8 @@
 			view = vw;
 			community = cm;
 			trackLeases(st);
-			if (!settingsSeeded && vw) {
-				form.coordinator_url = vw.coordinator_url;
-				form.concurrency = vw.concurrency;
-				settingsSeeded = true;
-			}
 		} catch (e) {
-			error = String(e);
+			error = errText(e);
 		}
 	}
 
@@ -102,6 +107,34 @@
 			clearInterval(clock);
 		};
 	});
+
+	// Tray "Settings…" opens the settings dialog (the Rust side shows the
+	// window and emits this event; Tauri only). The write happens inside an
+	// event callback, not the effect body, so it never re-triggers the effect.
+	$effect(() => {
+		if (!inTauri) return;
+		/** @type {any} */
+		let unlisten = null;
+		let alive = true;
+		listen('lh-settings', () => {
+			error = '';
+			note = '';
+			settingsOpen = true;
+		}).then((f) => {
+			if (alive) unlisten = f;
+			else f();
+		});
+		return () => {
+			alive = false;
+			unlisten?.();
+		};
+	});
+
+	/** FieldError-shaped rejections ({field, message}) arrive as objects. */
+	/** @param {any} e @returns {string} */
+	function errText(e) {
+		return e && typeof e === 'object' && typeof e.message === 'string' ? e.message : String(e);
+	}
 
 	/**
 	 * @param {string} cmd
@@ -116,10 +149,23 @@
 			if (typeof r === 'string') note = r;
 			await refresh();
 		} catch (e) {
-			error = String(e);
+			error = errText(e);
 			await refresh();
 		} finally {
 			busy = false;
+		}
+	}
+
+	/** Demo-mode Start/Pause: drive the synthetic session, then re-render. */
+	/** @param {() => void} fn */
+	function demoRunAction(fn) {
+		error = '';
+		note = '';
+		try {
+			fn();
+			refresh();
+		} catch (e) {
+			error = errText(e);
 		}
 	}
 
@@ -132,7 +178,12 @@
 	);
 
 	const activityText = $derived.by(() => {
-		if (phase === 'paused') return 'Paused — leases released, nothing being worked';
+		if (phase === 'paused') {
+			if (status?.pause_reason === 'schedule') {
+				return 'Paused — outside your active window; resumes automatically when the window opens';
+			}
+			return 'Paused — leases released, nothing being worked';
+		}
 		if (phase === 'stopping') return 'Stopping — in-flight leases settling';
 		if (phase === 'starting') return 'Starting the run loop…';
 		if (leasedSlots.length > 0) {
@@ -145,13 +196,36 @@
 		return 'Idle — no run in progress';
 	});
 
+	// Separator-joined meta line computed in JS: Svelte whitespace collapse
+	// eats the spaces around inline {#if} blocks and glues fragments.
+	const fineLine = $derived.by(() => {
+		const parts = [
+			status ? (status.dry_run ? 'dry run — staged locally, nothing submitted' : 'live run') : null,
+			status?.staging ?? null,
+			status ? `${status.concurrency ?? '—'} slots` : null
+		];
+		if (status?.schedule_enabled) {
+			const sched = view?.schedule;
+			const windowText = sched ? `active window ${sched.active_from}–${sched.active_until}` : 'active window';
+			parts.push(status.schedule_in_window ? `${windowText} · now inside` : `${windowText} · now outside`);
+		}
+		return parts.filter(Boolean).join(' · ') || '—';
+	});
+
 	function primaryAction() {
 		if (phase === 'running' || phase === 'paused' || phase === 'error') {
-			call(phase === 'running' ? 'pause_contributor' : 'start_contributor');
+			const isRun = phase === 'running';
+			if (inTauri) {
+				call(isRun ? 'pause_contributor' : 'start_contributor');
+			} else {
+				demoRunAction(isRun ? demoPauseContributor : demoStartContributor);
+			}
 		} else if (phase === 'starting') {
 			error = 'Startup already in progress.';
-		} else {
+		} else if (inTauri) {
 			call('start_contributor');
+		} else {
+			demoRunAction(demoStartContributor);
 		}
 	}
 
@@ -172,31 +246,18 @@
 	async function toggleDryRun(e) {
 		error = '';
 		try {
-			await invoke('save_settings', { input: { dry_run: e.currentTarget.checked } });
-			note = 'Dry-run setting applies on the next start.';
+			const input = { dry_run: e.currentTarget.checked };
+			if (inTauri) {
+				await invoke('save_settings', { input });
+				note = 'Dry-run setting applies on the next start.';
+			} else {
+				demoSaveSettings(input);
+				note = 'Dry-run setting applies on the next start (demo).';
+			}
 			await refresh();
 		} catch (err) {
-			error = String(err);
+			error = errText(err);
 		}
-	}
-
-	async function saveSettings() {
-		const input = {
-			coordinator_url: form.coordinator_url.trim() || undefined,
-			concurrency: Number(form.concurrency) || undefined,
-			public_key_hex: form.public_key_hex.trim() || undefined
-		};
-		await call('save_settings', { input });
-		note = 'Settings saved.';
-		form.public_key_hex = '';
-	}
-
-	async function register() {
-		await call('register_client');
-	}
-
-	async function testConnection() {
-		await call('check_coordinator');
 	}
 
 	function quit() {
@@ -276,13 +337,16 @@
 			<span class="logo" aria-hidden="true">⌖</span>
 			<h1>LandHunter Contributor</h1>
 		</div>
-		<span class="conn" role="status">
-			<span class="pill {coordinatorPill}">
+		<span class="conn">
+			<span class="pill {coordinatorPill}" role="status">
 				{status?.coordinator_ok === true ? 'online' : status?.coordinator_ok === false ? 'down' : 'checking…'}
 			</span>
 			<span class="conn-when">
 				{status?.last_health_ok_ms ? `last poll ${fmtClock(status.last_health_ok_ms)}` : 'contacting coordinator'}
 			</span>
+			<button class="icon-btn" aria-label="Open settings" title="Settings" onclick={() => (settingsOpen = true)}>
+				<span aria-hidden="true">⚙</span>
+			</button>
 		</span>
 	</header>
 
@@ -298,11 +362,7 @@
 			<span class="pill {phase}">{phase}</span>
 			<span class="activity">{activityText}</span>
 		</div>
-		<p class="fine">
-			{status?.dry_run ? 'dry run — staged locally, nothing submitted' : 'live run'} ·
-			{status?.staging ?? '—'} ·
-			{status?.concurrency ?? '—'} slots
-		</p>
+		<p class="fine">{fineLine}</p>
 		{#if slots.length}
 			<div class="leases">
 				{#each slots as s (s.slot)}
@@ -366,46 +426,13 @@
 		<button class="primary" onclick={primaryAction} disabled={busy || phase === 'starting' || phase === 'stopping'}>
 			{primaryLabel()}
 		</button>
-		<button onclick={register} disabled={busy || phase === 'running' || phase === 'starting'}>
-			Register
-		</button>
 		<button class="danger" onclick={quit} disabled={busy}>Quit</button>
 	</div>
 
 	<div class="toggle-row">
 		<label for="dryrun">Dry run (no results submitted)</label>
 		<input id="dryrun" type="checkbox" checked={status?.dry_run ?? true} onchange={toggleDryRun} />
-		<button onclick={testConnection} disabled={busy} style="margin-left:auto;padding:4px 8px;font-size:11.5px;">Test</button>
 	</div>
-
-	<details>
-		<summary>Settings &amp; identity</summary>
-		<div class="form">
-			<div>
-				<label for="coord">Coordinator URL</label>
-				<input id="coord" type="text" bind:value={form.coordinator_url} />
-			</div>
-			<div>
-				<label for="pubkey">Contract public key (ed25519, 64 hex)</label>
-				<input
-					id="pubkey"
-					type="password"
-					bind:value={form.public_key_hex}
-					placeholder={view?.public_key_configured ? `unchanged (…${view.public_key_tail})` : '64-char hex, or set LH_PUBLIC_KEY_HEX'}
-					autocomplete="off"
-				/>
-			</div>
-			<div>
-				<label for="conc">Concurrency (1–8 slots)</label>
-				<input id="conc" type="number" min="1" max="8" bind:value={form.concurrency} />
-			</div>
-			<button onclick={saveSettings} disabled={busy}>Save settings</button>
-			<p class="fine">
-				identity: {view?.credentials_present ? `registered as ${shortId(view.client_id)}` : 'not registered yet'}<br />
-				credentials: {view?.credentials_path ?? '—'}
-			</p>
-		</div>
-	</details>
 
 	<footer>
 		<span>app v{status?.gui_version ?? '0.1.0'} · lib v{status?.client_version ?? '—'}</span>
@@ -416,3 +443,7 @@
 		{/if}
 	</footer>
 </main>
+
+{#if settingsOpen}
+	<SettingsDialog {view} {status} onClose={() => (settingsOpen = false)} onChanged={refresh} />
+{/if}

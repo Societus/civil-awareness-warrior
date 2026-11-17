@@ -1,12 +1,15 @@
-// Tauri entry: window close-to-tray wiring + tray menu (Show / Pause / Quit).
+// Tauri entry: window close-to-tray wiring + tray menu (Show / Settings… /
+// Pause / Quit).
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod contributor;
 mod settings;
 
+use std::sync::Arc;
+
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::{Manager, WindowEvent};
+use tauri::{Emitter, Manager, WindowEvent};
 
 fn main() {
     tauri::Builder::default()
@@ -18,14 +21,24 @@ fn main() {
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
             let settings = settings::load_or_create(&data_dir)?;
-            app.manage(contributor::AppState::new(data_dir, settings));
+            // AppState behind an Arc: background tasks and the lifecycle
+            // tests share it; the tray handlers reach it via managed state.
+            let state = Arc::new(contributor::AppState::new(
+                data_dir,
+                settings,
+                Some(handle.clone()),
+            ));
+            app.manage(state.clone());
 
-            // Tray menu: Show / Pause (toggles to Resume at runtime) / Quit.
+            // Tray menu: Show / Settings… / Pause (toggles to Resume at
+            // runtime) / Quit.
             let show = MenuItem::with_id(&handle, "show", "Show", true, None::<&str>)?;
+            let open_settings =
+                MenuItem::with_id(&handle, "settings", "Settings…", true, None::<&str>)?;
             let pause = MenuItem::with_id(&handle, "pause", "Resume", true, None::<&str>)?;
             let quit = MenuItem::with_id(&handle, "quit", "Quit", true, None::<&str>)?;
             let sep = PredefinedMenuItem::separator(&handle)?;
-            let menu = Menu::with_items(&handle, &[&show, &pause, &sep, &quit])?;
+            let menu = Menu::with_items(&handle, &[&show, &open_settings, &pause, &sep, &quit])?;
 
             TrayIconBuilder::with_id(contributor::TRAY_ID)
                 .menu(&menu)
@@ -44,19 +57,30 @@ fn main() {
                             let _ = w.set_focus();
                         }
                     }
+                    "settings" => {
+                        // Settings… shows the window (it may be hidden in
+                        // the tray) and tells the webview to open the
+                        // settings dialog.
+                        if let Some(w) = app_handle.get_webview_window("main") {
+                            let _ = w.show();
+                            let _ = w.set_focus();
+                        }
+                        let _ = app_handle.emit("lh-settings", ());
+                    }
                     "pause" => contributor::toggle_pause(app_handle),
                     "quit" => contributor::graceful_shutdown_and_exit(app_handle),
                     _ => {}
                 })
                 .build(&handle)?;
 
-            contributor::set_pause_label(&handle, false);
-            contributor::start_background_tasks(&handle);
+            contributor::start_background_tasks(&state);
 
             // First coordinator health probe off the startup path.
-            let h = handle.clone();
-            tauri::async_runtime::spawn(async move {
-                contributor::poll_health(&h).await;
+            tauri::async_runtime::spawn({
+                let s = state.clone();
+                async move {
+                    contributor::poll_health(&s).await;
+                }
             });
             Ok(())
         })
@@ -74,6 +98,7 @@ fn main() {
             contributor::pause_contributor,
             contributor::resume_contributor,
             contributor::register_client,
+            contributor::unregister_identity,
             contributor::check_coordinator,
             contributor::get_settings_view,
             contributor::save_settings,

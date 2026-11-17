@@ -38,8 +38,10 @@ use package.json subpath imports instead (`"imports": { "#lib/*":
 
 Wired:
 
-- **Tray** (`src-tauri/src/main.rs`): Show / Pause⇄Resume / Quit menu; the
-  Pause item's label flips at runtime with the run-loop phase.
+- **Tray** (`src-tauri/src/main.rs`): Show / Settings… / Pause⇄Resume / Quit
+  menu; the Pause item's label flips at runtime with the run-loop phase.
+  Settings… shows the window and emits `lh-settings`, which opens the webview
+  settings dialog.
 - **Minimize-to-tray**: the close button hides the window
   (`prevent_close` + `hide`); the app and an active loop keep running. Quit
   is only via tray or the Quit button.
@@ -67,7 +69,9 @@ Wired:
   verifying→executing→submitting share one timer), headline tiles for
   completed / verified / failed / bytes-staged, session uptime, total runtime
   across sessions, coordinator pill with the last-successful-poll timestamp,
-  a community-total line, dry-run toggle, Start/Pause/Resume, Register, Quit.
+  a community-total line, dry-run toggle, Start/Pause/Resume, Quit, and a gear
+  button that opens the settings dialog (Register lives in the dialog's
+  Identity section).
   Stats are polled every 2 s via `get_status` (async invoke — the UI thread
   never blocks); lease timers tick on a 1 s wall-clock anchor.
 - **Community totals** (`community_stats` command): the Rust side fetches the
@@ -87,9 +91,36 @@ Wired:
   through the public `GET /v1/chunk/:id/contract` endpoint (`ApiClient::
   fetch_contract`), cached with bounded retries; on lookup failure the row
   degrades to the chunk id.
-- **Settings**: coordinator URL, contract public key, concurrency (1–8),
-  dry-run — persisted to `settings.json` (0600). Public key may alternatively
-  come from `LH_PUBLIC_KEY_HEX`.
+- **Settings** (`src-tauri/src/settings.rs` + `src/lib/SettingsDialog.svelte`,
+  card t_2b8170a8): persisted to `settings.json` (0600). A `SettingsInput` is
+  a partial update — unset fields keep their stored values; `public_key_hex`
+  empty means "unchanged" (the dialog shows the stored tail `…xxxxxx` as the
+  placeholder). Validation returns a `FieldError { field, message }` so the
+  dialog renders the message **under the exact control that is wrong**
+  (capabilities-empty, concurrency out of 1–8, unparseable times, bad URL…).
+  `capabilities` and `schedule` carry `serde(default)`: a settings.json
+  written by an older build loads and simply gains today's defaults.
+- **Capabilities**: five per-chunk-type opt-ins (examination / ingest /
+  alt_source / state_walk / search). Descriptions are verbatim from the
+  coordinator landing page (`lh-tracker/src/routes/landing.ts` → "What
+  Workers Do") so the GUI and the public page tell volunteers the same thing.
+  The enabled set flows into the lib's lease polls as
+  `RunOptions.config.capabilities` (Vec<ChunkType>) at the next start;
+  enabling none is rejected on both sides.
+- **Run-window schedule**: `active_from`/`active_until` local-clock window,
+  default disabled ("always"); overnight windows wrap. When enabled, a 15 s
+  watcher politely stops a live loop outside the window (reason `schedule`)
+  and auto-resumes when the window reopens — a user Pause is never
+  auto-resumed. Saving a schedule edit applies immediately (the save calls
+  the watcher); status carries `schedule_enabled` / `schedule_in_window` and
+  the pause label says "outside your active window".
+- **Unregister**: two-step button (arm → confirm). Refused while the loop is
+  live (pause first). Deletes the local credentials file, clears the client
+  id and restarts the registration state; the coordinator exposes no revoke
+  endpoint, so open leases simply lapse and requeue for other volunteers —
+  stated verbatim in the UI.
+- **Advanced** section is an explicit placeholder for the LLM-chunk card's
+  options (local model opt-in, resource caps, model status).
 
 Stubbed / not yet here:
 
@@ -124,6 +155,7 @@ The actual data dir path is displayed in the app under
 | `LH_COORDINATOR_URL` | coordinator base URL (first-run seed only) | `https://cap.landhunter.app` |
 | `LH_CONCURRENCY` | worker slots 1–8 (first-run seed) | `2` |
 | `LH_GUI_DRY_RUN` | first-run dry-run default (`0`/`false` disables) | `true` |
+| `LH_CAPABILITIES` | first-run capability seed — comma list of chunk types (unknown name ⇒ warn + all types) | all five |
 | `LH_BRAVE_API_KEY` | search-chunk backend key, passed through to the lib | — |
 | `LH_UPLOAD_PRESIGN_TEMPLATE` | presigned upload URL template containing `{key}` | — |
 | `LH_R2_BUCKET` / `LH_R2_ACCESS_KEY_ID` / `LH_R2_SECRET_ACCESS_KEY` + `LH_R2_ENDPOINT` or `LH_R2_ACCOUNT_ID` | direct R2 staging for real runs | local (dry-run only) |
@@ -135,8 +167,10 @@ Notes:
   the source of truth. `LH_PUBLIC_KEY_HEX` remains a live fallback while the
   stored key is empty. Staging vars (`LH_R2_*`, presign) are read live at
   each start.
-- Settings changes (dry-run, concurrency, coordinator URL) take effect on
-  the next start — pause/resume applies them.
+- Settings changes take effect as follows: **schedule** immediately (the save
+  invokes the window watcher — an out-of-window save politely stops a live
+  loop); dry-run, concurrency, capabilities and coordinator URL apply on the
+  next start — pause/resume applies them.
 
 ## Verification state
 
@@ -144,15 +178,32 @@ Notes:
 - `cargo build` green against `lh-contributor-client` c3729ac (binary links;
   248 MB debug at `src-tauri/target/debug/lh-contributor-gui`).
 - `npx svelte-check --threshold warning`: 0 errors / 0 warnings (a11y
-  included). `cargo test`: 3/3 (runtime-delta policy, lease target mapping,
-  runtime.json round-trip). `cargo clippy --all-targets`: 0 warnings.
-- Dashboard rendering verified headlessly: headless-chromium at 360×480 shows
-  header, activity + lease rows (elapsed timers), the four tiles and the
-  runtime rows with values ticking between polls (bytes staged 820 KB →
-  1.1 MB across dumps); `.harness/render.mjs` (jsdom, real component)
-  asserts live updates + every required line against the mock run loop
-  ("demo mode"). The real lib `StatsHandle` path (via `get_status`) shares
-  those same rendering paths, but an actual Tauri window/tray session has
-  still not been exercised on this headless box.
+  included). `cargo test`: 12/12 — the original runtime-delta / lease-target /
+  runtime.json tests plus: settings round-trip with capabilities+schedule,
+  legacy settings.json back-compat, validation pinpoints the bad field,
+  window-membership boundaries + overnight wrap, `LH_CAPABILITIES` csv seed,
+  schedule-gate/manual-pause semantics, unregister-while-active refusal,
+  **settings actually drive the RunOptions the lib consumes** (capabilities
+  reach the lease polls, concurrency reaches the lib's stats slots), and a
+  full **fake-coordinator lifecycle test** (register → leases with the
+  configured capabilities → schedule-pause observed as stopped polling →
+  window reopens → auto-resume → re-pause → resume → unregister → re-register
+  as a new identity, with a wire-capture log). `cargo clippy --all-targets`:
+  0 warnings.
+- Dashboard + settings-dialog rendering verified headlessly: headless-chromium
+  at 360×480 shows the wrapped header (gear never crushes the title),
+  activity + lease rows (elapsed timers) and tiles with values ticking between
+  polls (bytes staged 820 KB → 1.1 MB across dumps); the dialog at 360×900
+  (`/?settings`) shows all five capability rows with landing-page copy, the
+  slider, schedule and placeholders. `.harness/render.mjs` (jsdom, real
+  components incl. the dialog opened through the real gear click) asserts the
+  dashboard lines, ~30 dialog strings, the public-key tail placeholder,
+  scrim-close, the persistence round-trip (stored caps/schedule/concurrency
+  reflected in status), capability gating of the demo lease loop, FieldError
+  validation (rejected saves leave the store byte-identical — module path and
+  real-click UI path showing the inline error), pause→resume, register and
+  unregister (refused while live). The real lib `StatsHandle` path (via
+  `get_status`) shares those rendering paths, but an actual Tauri window/tray
+  session has still not been exercised on this headless box.
 - House rules: local repo only (no remote), `commit.gpgsign false`
   repo-local, unsigned commits, `lh-contributor-client` is read-only here.
