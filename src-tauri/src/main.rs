@@ -77,6 +77,7 @@ fn main() {
             contributor::check_coordinator,
             contributor::get_settings_view,
             contributor::save_settings,
+            contributor::community_stats,
             contributor::quit_app
         ])
         .run(tauri::generate_context!())

@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -40,6 +40,16 @@ pub const TRAY_ID: &str = "lh-contributor-tray";
 
 const HEALTH_POLL_SECS: u64 = 20;
 const ENRICH_POLL_SECS: u64 = 2;
+const RUNTIME_TICK_SECS: u64 = 1;
+/// Persist the cross-session runtime total every N 1 s ticks; pauses, run
+/// endings and quit flush eagerly, so a crash loses at most this much.
+const RUNTIME_PERSIST_TICKS: u64 = 30;
+/// Runner uptime is monotonic, so a 1 s tick can only advance 0–1 s (plus
+/// rounding). Anything larger means the snapshot came from a different
+/// (newer) Runner than the one `prev` tracked — reject, don't retro-add.
+const RUNTIME_MAX_TICK_SECS: u64 = 5;
+const COMMUNITY_TTL_MS: i64 = 60_000;
+const COMMUNITY_RETRY_MS: i64 = 15_000;
 /// Contract lookups attempted per chunk_id before giving up (UI falls back
 /// to the chunk id itself).
 const LEASE_LOOKUP_MAX_ATTEMPTS: u8 = 3;
@@ -85,6 +95,10 @@ struct ActiveRun {
     stop_tx: watch::Sender<bool>,
     stop_requested: bool,
     finished: bool,
+    /// Uptime frozen at run() completion. The lib's snapshot().uptime is
+    /// computed from an Instant and keeps advancing on a finished Runner;
+    /// without this, a paused session's "session uptime" would tick forever.
+    final_uptime_secs: u64,
 }
 
 pub struct AppState {
@@ -99,10 +113,22 @@ pub struct AppState {
     /// chunk_id → target_key, filled by the enrichment task.
     lease_targets: Mutex<HashMap<String, String>>,
     lease_attempts: Mutex<HashMap<String, u8>>,
+    /// Cross-session runtime total (persisted to runtime.json).
+    /// `runtime_total` holds settled tick seconds; the live tail since the
+    /// last tick is added in get_status from `runtime_prev_uptime`.
+    runtime_total: AtomicU64,
+    runtime_prev_uptime: AtomicU64,
+    runtime_persist_ticks: AtomicU64,
+    /// 60 s-cached copy of the tracker's /public/stats.json (None until the
+    /// first successful fetch; failures serve stale).
+    community: Mutex<Option<CommunityStats>>,
+    community_next_attempt_ms: AtomicI64,
+    community_fetching: AtomicBool,
 }
 
 impl AppState {
     pub fn new(data_dir: PathBuf, settings: GuiSettings) -> AppState {
+        let runtime = settings::load_runtime(&data_dir);
         AppState {
             data_dir,
             settings: Mutex::new(settings),
@@ -113,6 +139,12 @@ impl AppState {
             active: Mutex::new(None),
             lease_targets: Mutex::new(HashMap::new()),
             lease_attempts: Mutex::new(HashMap::new()),
+            runtime_total: AtomicU64::new(runtime.total_runtime_secs),
+            runtime_prev_uptime: AtomicU64::new(0),
+            runtime_persist_ticks: AtomicU64::new(0),
+            community: Mutex::new(None),
+            community_next_attempt_ms: AtomicI64::new(0),
+            community_fetching: AtomicBool::new(false),
         }
     }
 
@@ -257,6 +289,8 @@ pub fn start(app: &AppHandle) -> Result<(), String> {
     *guard(&st.active) = None; // drop the previous session's stats view
     guard(&st.lease_targets).clear();
     guard(&st.lease_attempts).clear();
+    // New Runner → its uptime starts at 0; reset the accumulation anchor.
+    st.runtime_prev_uptime.store(0, Ordering::Relaxed);
 
     let fail = |msg: String| {
         *guard(&st.last_error) = Some(msg.clone());
@@ -287,6 +321,7 @@ pub fn start(app: &AppHandle) -> Result<(), String> {
         stop_tx,
         stop_requested: false,
         finished: false,
+        final_uptime_secs: 0,
     });
     st.set_phase(Phase::Running);
     set_pause_label(app, true);
@@ -299,9 +334,31 @@ pub fn start(app: &AppHandle) -> Result<(), String> {
             .as_ref()
             .map(|r| r.stop_requested)
             .unwrap_or(false);
-        if let Some(run) = guard(&st.active).as_mut() {
-            run.finished = true;
+        let tail_secs = {
+            let mut active = guard(&st.active);
+            match active.as_mut() {
+                Some(run) if !run.finished => {
+                    // Freeze the session's final uptime now: later snapshots
+                    // of this handle would keep ticking (Instant-based uptime).
+                    let cur = run.stats.snapshot().uptime.as_secs();
+                    run.finished = true;
+                    run.final_uptime_secs = cur;
+                    // Seconds between the last 1 s runtime tick and this
+                    // completion — fold the tail into the total before flush.
+                    cur.saturating_sub(st.runtime_prev_uptime.load(Ordering::Relaxed))
+                        .min(RUNTIME_MAX_TICK_SECS)
+                }
+                Some(run) => {
+                    run.finished = true;
+                    0
+                }
+                None => 0,
+            }
+        };
+        if tail_secs > 0 {
+            st.runtime_total.fetch_add(tail_secs, Ordering::Relaxed);
         }
+        st.runtime_prev_uptime.store(0, Ordering::Relaxed);
         match result {
             Ok(()) => st.set_phase(if was_user_stop { Phase::Paused } else { Phase::Idle }),
             Err(e) => {
@@ -309,6 +366,7 @@ pub fn start(app: &AppHandle) -> Result<(), String> {
                 st.set_phase(Phase::Error);
             }
         }
+        flush_runtime(&st);
         set_pause_label(&app2, false);
     });
     Ok(())
@@ -324,6 +382,7 @@ pub fn pause(app: &AppHandle) -> Result<(), String> {
             }
             st.set_phase(Phase::Stopping);
             set_pause_label(app, false);
+            flush_runtime(&st);
             Ok(())
         }
         Phase::Stopping => Err("already stopping — waiting for in-flight leases to settle".to_string()),
@@ -350,6 +409,7 @@ pub fn graceful_shutdown_and_exit(app: &AppHandle) {
         let _ = run.stop_tx.send(true);
     }
     st.set_phase(Phase::Stopping);
+    flush_runtime(&st);
     // Grace window for the runner to finish in-flight reports before exit.
     let handle = app.clone();
     std::thread::spawn(move || {
@@ -394,6 +454,13 @@ pub fn start_background_tasks(app: &AppHandle) {
         loop {
             tokio::time::sleep(Duration::from_secs(ENRICH_POLL_SECS)).await;
             enrich_leases(&h).await;
+        }
+    });
+    let h = app.clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(RUNTIME_TICK_SECS)).await;
+            runtime_tick(&h).await;
         }
     });
 }
@@ -482,6 +549,57 @@ async fn enrich_leases(app: &AppHandle) {
 }
 
 // ---------------------------------------------------------------------------
+// Cross-session runtime total
+// ---------------------------------------------------------------------------
+
+/// Whole seconds to add to the cross-session total for one 1 s tick.
+/// None when uptime went backwards (a new Runner) or jumped implausibly.
+fn runtime_delta(prev_uptime_secs: u64, cur_uptime_secs: u64) -> Option<u64> {
+    let d = cur_uptime_secs.saturating_sub(prev_uptime_secs);
+    if d == 0 || d > RUNTIME_MAX_TICK_SECS {
+        None
+    } else {
+        Some(d)
+    }
+}
+
+fn flush_runtime(st: &AppState) {
+    st.runtime_persist_ticks.store(0, Ordering::Relaxed);
+    let state = settings::RuntimeState {
+        total_runtime_secs: st.runtime_total.load(Ordering::Relaxed),
+    };
+    if let Err(e) = settings::write_runtime(&st.data_dir, &state) {
+        eprintln!("runtime.json: {e}");
+    }
+}
+
+async fn runtime_tick(app: &AppHandle) {
+    let st = app.state::<AppState>();
+    let snap = {
+        let active = guard(&st.active);
+        match active.as_ref() {
+            Some(run) if !run.finished => Some(run.stats.snapshot()),
+            _ => None,
+        }
+    };
+    let Some(snap) = snap else {
+        // No live Runner: the next session re-anchors from 0.
+        st.runtime_prev_uptime.store(0, Ordering::Relaxed);
+        return;
+    };
+    let cur = snap.uptime.as_secs();
+    let prev = st.runtime_prev_uptime.swap(cur, Ordering::Relaxed);
+    if let Some(d) = runtime_delta(prev, cur) {
+        st.runtime_total.fetch_add(d, Ordering::Relaxed);
+    }
+    let ticks = st.runtime_persist_ticks.fetch_add(1, Ordering::Relaxed);
+    if ticks >= RUNTIME_PERSIST_TICKS {
+        st.runtime_persist_ticks.store(0, Ordering::Relaxed);
+        flush_runtime(&st);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Serialized views for the frontend
 // ---------------------------------------------------------------------------
 
@@ -511,6 +629,10 @@ pub struct UiStatus {
     pub last_health_ok_ms: Option<i64>,
     pub dry_run: bool,
     pub concurrency: u32,
+    /// Wall time the contributor loop has run across every session
+    /// (accumulated GUI-side, seeded from runtime.json; includes the live
+    /// session's tail).
+    pub total_runtime_secs: u64,
     pub staging: &'static str,
     pub credentials_present: bool,
     pub client_id: Option<String>,
@@ -611,7 +733,7 @@ pub fn get_status(app: AppHandle) -> UiStatus {
     let settings = st.settings_snapshot();
     let error = guard(&st.last_error).clone();
 
-    let (stats, slots) = {
+    let (stats, slots, live_tail_secs) = {
         let active = guard(&st.active);
         match active.as_ref() {
             Some(run) => {
@@ -623,18 +745,33 @@ pub fn get_status(app: AppHandle) -> UiStatus {
                     .enumerate()
                     .map(|(i, a)| slot_out(i, a, &targets))
                     .collect();
+                // Finished Runner → use the uptime frozen at completion;
+                // snapshot().uptime is Instant-based and would tick forever.
+                let uptime_secs = if run.finished {
+                    run.final_uptime_secs
+                } else {
+                    snap.uptime.as_secs()
+                };
+                let live_tail = if run.finished {
+                    0
+                } else {
+                    uptime_secs
+                        .saturating_sub(st.runtime_prev_uptime.load(Ordering::Relaxed))
+                        .min(RUNTIME_MAX_TICK_SECS)
+                };
                 (
                     Some(StatsOut {
                         chunks_completed: snap.chunks_completed,
                         chunks_failed: snap.chunks_failed,
                         chunks_verified: snap.chunks_verified,
                         bytes_staged: snap.bytes_staged,
-                        uptime_secs: snap.uptime.as_secs(),
+                        uptime_secs,
                     }),
                     slots,
+                    live_tail,
                 )
             }
-            None => (None, Vec::new()),
+            None => (None, Vec::new(), 0),
         }
     };
 
@@ -652,6 +789,7 @@ pub fn get_status(app: AppHandle) -> UiStatus {
         },
         dry_run: settings.dry_run,
         concurrency: settings.concurrency,
+        total_runtime_secs: st.runtime_total.load(Ordering::Relaxed) + live_tail_secs,
         staging: AppState::staging_mode(&settings),
         credentials_present: st.creds_path().exists(),
         client_id: st.credentials().map(|c| c.client_id),
@@ -761,6 +899,125 @@ pub fn save_settings(app: AppHandle, input: SettingsInput) -> Result<SettingsVie
     *guard(&st.settings) = s.clone();
     settings::write(&st.data_dir, &s)?;
     Ok(settings_view(&st))
+}
+
+/// Subset of the tracker's `/public/stats.json` rendered on the community
+/// line. Every field defaults to 0 so endpoint drift can't break the GUI.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CommunityStats {
+    #[serde(default)]
+    pub chunks_verified: u64,
+    #[serde(default)]
+    pub chunks_pending: u64,
+    #[serde(default)]
+    pub chunks_leased: u64,
+    #[serde(default)]
+    pub warriors_online: u64,
+    #[serde(default)]
+    pub warriors_total: u64,
+    #[serde(default)]
+    pub updated_at: i64,
+}
+
+async fn fetch_community(url: &str) -> Result<CommunityStats, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client.get(url).send().await.map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    let body = resp.text().await.map_err(|e| e.to_string())?;
+    serde_json::from_str::<CommunityStats>(&body).map_err(|e| format!("bad /public/stats.json: {e}"))
+}
+
+/// Community totals for the dashboard line. The 60 s cache lives here (the
+/// frontend polls this every 2 s; only one network hit per minute actually
+/// leaves the box). Failures never surface: stale cache if any, else null,
+/// which the UI hides.
+#[tauri::command]
+pub async fn community_stats(app: AppHandle) -> Option<CommunityStats> {
+    let st = app.state::<AppState>();
+    if now_ms() < st.community_next_attempt_ms.load(Ordering::Relaxed) {
+        return guard(&st.community).clone();
+    }
+    if st.community_fetching.swap(true, Ordering::Relaxed) {
+        // Another poll is already fetching; serve whatever we have.
+        return guard(&st.community).clone();
+    }
+    let url = format!(
+        "{}/public/stats.json",
+        st.settings_snapshot().coordinator_url.trim_end_matches('/')
+    );
+    let result = fetch_community(&url).await;
+    st.community_fetching.store(false, Ordering::Relaxed);
+    let fresh = now_ms();
+    match result {
+        Ok(stats) => {
+            st.community_next_attempt_ms
+                .store(fresh + COMMUNITY_TTL_MS, Ordering::Relaxed);
+            *guard(&st.community) = Some(stats.clone());
+            Some(stats)
+        }
+        Err(_) => {
+            st.community_next_attempt_ms
+                .store(fresh + COMMUNITY_RETRY_MS, Ordering::Relaxed);
+            guard(&st.community).clone()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lh_contributor_client::api::ChunkType;
+
+    #[test]
+    fn runtime_delta_counts_single_second_ticks() {
+        assert_eq!(runtime_delta(10, 11), Some(1));
+        assert_eq!(runtime_delta(10, 12), Some(2));
+        assert_eq!(runtime_delta(10, 10), None);
+        // A new Runner re-anchors uptime smaller than the old session's prev.
+        assert_eq!(runtime_delta(4300, 2), None);
+        // Implausible jumps (different/newer Runner snapshot) never retro-add.
+        assert_eq!(runtime_delta(10, 10_000), None);
+    }
+
+    #[test]
+    fn slot_out_resolves_target_key_through_the_cache() {
+        let mut targets = HashMap::new();
+        targets.insert("c1".to_string(), "Maricopa AZ/parcel-00042".to_string());
+        let s = slot_out(
+            0,
+            &SlotActivity::Executing {
+                chunk_id: "c1".to_string(),
+                chunk_type: ChunkType::StateWalk,
+            },
+            &targets,
+        );
+        assert_eq!(s.activity, "executing");
+        assert_eq!(s.chunk_id.as_deref(), Some("c1"));
+        assert_eq!(s.chunk_type.as_deref(), Some("state_walk"));
+        assert_eq!(s.target_key.as_deref(), Some("Maricopa AZ/parcel-00042"));
+
+        let p = slot_out(1, &SlotActivity::Polling, &targets);
+        assert_eq!(p.activity, "polling");
+        assert_eq!(p.chunk_id, None);
+        assert_eq!(p.target_key, None);
+
+        // Unknown lease degrades to the chunk id (target_key stays None).
+        let u = slot_out(
+            2,
+            &SlotActivity::Submitting {
+                chunk_id: "zz".to_string(),
+            },
+            &targets,
+        );
+        assert_eq!(u.activity, "submitting");
+        assert_eq!(u.chunk_id.as_deref(), Some("zz"));
+        assert_eq!(u.target_key, None);
+    }
 }
 
 #[tauri::command]

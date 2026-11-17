@@ -1,28 +1,92 @@
 <script>
 	import { invoke } from '@tauri-apps/api/core';
+	import { makeDemoStatus, makeDemoCommunity, makeDemoSettingsView } from '#lib/demo.js';
 
 	const inTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+	const demoStartedAtMs = Date.now();
 
 	/** @type {any} */
 	let status = $state(null);
 	/** @type {any} */
 	let view = $state(null);
+	/** @type {any} */
+	let community = $state(null);
 	let error = $state('');
 	let note = $state('');
 	let busy = $state(false);
-	let settingsLoaded = $state(false);
+	/** Plain flag (NOT $state): seeding must not feed the polling effect's
+	 *  dependency graph. */
+	let settingsSeeded = false;
+	/** Wall-clock anchor so the per-lease timers tick between polls. */
+	let now = $state(Date.now());
 
 	let form = $state({ coordinator_url: '', public_key_hex: '', concurrency: 2 });
 
+	/**
+	 * Per-lease elapsed tracking. The lib's stats handle carries no lease
+	 * age, so each slot's current chunk_id gets a first-seen timestamp;
+	 * elapsed is keyed on chunk_id, so verifying→executing→submitting all
+	 * share one timer and a new lease resets it. Accuracy is ± the poll
+	 * interval (2 s), plenty for a glance-at display.
+	 * @type {Map<number, { chunkId: string | null, sinceMs: number }>}
+	 */
+	const leaseStarts = new Map();
+
+	/** @param {any} st */
+	function trackLeases(st) {
+		const at = Date.now();
+		/** @type {any[]} */
+		const slots = st?.slots ?? [];
+		for (const s of slots) {
+			const id = s.chunk_id ?? null;
+			const rec = leaseStarts.get(s.slot);
+			if (!rec || rec.chunkId !== id) {
+				leaseStarts.set(s.slot, { chunkId: id, sinceMs: at });
+			}
+		}
+		for (const key of [...leaseStarts.keys()]) {
+			if (!slots.some((s) => s.slot === key)) leaseStarts.delete(key);
+		}
+	}
+
+	/**
+	 * Pull the lib's stats handle via get_status (2 s tick, async invoke —
+	 * the UI thread never blocks). Outside Tauri the synthetic demo status
+	 * takes the same code path so the dashboard is previewable in a browser.
+	 *
+	 * IMPORTANT: results land in LOCAL variables before being written to
+	 * state, and all reads of them use the locals. Calling this synchronously
+	 * from the polling $effect would otherwise make the effect READ the same
+	 * state it WRITES (trackLeases(status), seed guard) → self-triggering →
+	 * effect_update_depth_exceeded. (In the Tauri branch the awaits untrack
+	 * the writes, but the demo branch has none.)
+	 */
 	async function refresh() {
-		if (!inTauri) return;
 		try {
-			status = await invoke('get_status');
-			view = await invoke('get_settings_view');
-			if (!settingsLoaded && view) {
-				form.coordinator_url = view.coordinator_url;
-				form.concurrency = view.concurrency;
-				settingsLoaded = true;
+			/** @type {any} */
+			let st;
+			/** @type {any} */
+			let vw;
+			/** @type {any} */
+			let cm;
+			if (inTauri) {
+				st = await invoke('get_status');
+				vw = await invoke('get_settings_view');
+				cm = await invoke('community_stats');
+			} else {
+				const t = Math.max(1, Math.floor((Date.now() - demoStartedAtMs) / 1000));
+				st = makeDemoStatus(t);
+				vw = makeDemoSettingsView();
+				cm = makeDemoCommunity();
+			}
+			status = st;
+			view = vw;
+			community = cm;
+			trackLeases(st);
+			if (!settingsSeeded && vw) {
+				form.coordinator_url = vw.coordinator_url;
+				form.concurrency = vw.concurrency;
+				settingsSeeded = true;
 			}
 		} catch (e) {
 			error = String(e);
@@ -30,10 +94,13 @@
 	}
 
 	$effect(() => {
-		if (!inTauri) return;
 		refresh();
-		const t = setInterval(refresh, 2000);
-		return () => clearInterval(t);
+		const poll = setInterval(refresh, 2000); // 1–2 s stats tick
+		const clock = setInterval(() => (now = Date.now()), 1000); // lease timers
+		return () => {
+			clearInterval(poll);
+			clearInterval(clock);
+		};
 	});
 
 	/**
@@ -57,18 +124,26 @@
 	}
 
 	const phase = $derived(status?.phase ?? 'idle');
-
-	const primaryLabel = $derived(
-		phase === 'running'
-			? 'Pause'
-			: phase === 'stopping'
-				? 'Pausing…'
-				: phase === 'paused'
-					? 'Resume'
-					: phase === 'error'
-						? 'Retry'
-						: 'Start'
+	/** @type {any[]} */
+	const slots = $derived(status?.slots ?? []);
+	const leasedSlots = $derived(slots.filter((s) => s.chunk_id != null));
+	const coordinatorPill = $derived(
+		status?.coordinator_ok === true ? 'ok' : status?.coordinator_ok === false ? 'down' : ''
 	);
+
+	const activityText = $derived.by(() => {
+		if (phase === 'paused') return 'Paused — leases released, nothing being worked';
+		if (phase === 'stopping') return 'Stopping — in-flight leases settling';
+		if (phase === 'starting') return 'Starting the run loop…';
+		if (leasedSlots.length > 0) {
+			const first = leasedSlots[0];
+			const parts = [first.chunk_type ?? 'chunk', first.target_key ?? shortId(first.chunk_id)];
+			const extra = leasedSlots.length > 1 ? ` (+${leasedSlots.length - 1} more)` : '';
+			return `Leased — ${parts.filter(Boolean).join(' · ')}${extra}`;
+		}
+		if (phase === 'running') return 'Idle — polling the coordinator for work';
+		return 'Idle — no run in progress';
+	});
 
 	function primaryAction() {
 		if (phase === 'running' || phase === 'paused' || phase === 'error') {
@@ -78,6 +153,19 @@
 		} else {
 			call('start_contributor');
 		}
+	}
+
+	/** @returns {string} */
+	function primaryLabel() {
+		return phase === 'running'
+			? 'Pause'
+			: phase === 'stopping'
+				? 'Pausing…'
+				: phase === 'paused'
+					? 'Resume'
+					: phase === 'error'
+						? 'Retry'
+						: 'Start';
 	}
 
 	/** @param {Event & { currentTarget: HTMLInputElement }} e */
@@ -115,6 +203,19 @@
 		call('quit_app');
 	}
 
+	/** @param {number} slotId */
+	function leaseElapsed(slotId) {
+		const rec = leaseStarts.get(slotId);
+		if (!rec || rec.chunkId == null) return null;
+		return Math.max(0, now - rec.sinceMs);
+	}
+
+	/** @param {any} s @returns {string} */
+	function slotText(s) {
+		const idPart = s.target_key ?? (s.chunk_id ? shortId(s.chunk_id) : null);
+		return [idPart, s.chunk_type].filter(Boolean).join(' · ') || 'waiting for a lease';
+	}
+
 	/** @param {number | null | undefined} n */
 	function fmtBytes(n) {
 		if (n == null) return '—';
@@ -131,12 +232,35 @@
 	/** @param {number | null | undefined} s */
 	function fmtUptime(s) {
 		if (s == null) return '—';
-		const h = Math.floor(s / 3600);
+		const d = Math.floor(s / 86400);
+		const h = Math.floor((s % 86400) / 3600);
 		const m = Math.floor((s % 3600) / 60);
 		const sec = s % 60;
+		if (d) return `${d}d ${h}h`;
 		if (h) return `${h}h ${m}m`;
 		if (m) return `${m}m ${sec}s`;
 		return `${sec}s`;
+	}
+
+	/** mm:ss (h:mm:ss past an hour) — the live per-lease timer. @param {number} ms */
+	function fmtElapsed(ms) {
+		const sec = Math.floor(ms / 1000);
+		const h = Math.floor(sec / 3600);
+		const m = Math.floor((sec % 3600) / 60);
+		const s = sec % 60;
+		return h
+			? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+			: `${m}:${String(s).padStart(2, '0')}`;
+	}
+
+	/** @param {number} ms */
+	function fmtClock(ms) {
+		return new Date(ms).toLocaleTimeString([], { hour12: false });
+	}
+
+	/** @param {number | null | undefined} n */
+	function fmtNum(n) {
+		return (n ?? 0).toLocaleString();
 	}
 
 	/** @param {string | null | undefined} id */
@@ -152,17 +276,15 @@
 			<span class="logo" aria-hidden="true">⌖</span>
 			<h1>LandHunter Contributor</h1>
 		</div>
-		<span
-			class="pill {status?.coordinator_ok === true ? 'ok' : status?.coordinator_ok === false ? 'error' : ''}"
-			role="status"
-		>
-			{status?.coordinator_ok === true ? 'coordinator online' : status?.coordinator_ok === false ? 'coordinator down' : 'checking…'}
+		<span class="conn" role="status">
+			<span class="pill {coordinatorPill}">
+				{status?.coordinator_ok === true ? 'online' : status?.coordinator_ok === false ? 'down' : 'checking…'}
+			</span>
+			<span class="conn-when">
+				{status?.last_health_ok_ms ? `last poll ${fmtClock(status.last_health_ok_ms)}` : 'contacting coordinator'}
+			</span>
 		</span>
 	</header>
-
-	{#if !inTauri}
-		<div class="banner" role="alert">Not running inside Tauri — use <code>npm run tauri dev</code>.</div>
-	{/if}
 
 	{#if error || status?.error}
 		<div class="banner" role="alert">{error || status.error}</div>
@@ -170,68 +292,81 @@
 		<div class="note" role="status">{note}</div>
 	{/if}
 
-	<section class="card" aria-label="Run status">
+	<section class="card" aria-label="Current activity">
+		<h2>Activity</h2>
 		<div class="status-row">
 			<span class="pill {phase}">{phase}</span>
-			<span class="fine">
-				{status?.dry_run ? 'dry run — no results submitted' : 'live run'} ·
-				{status?.staging ?? '—'} ·
-				{status?.concurrency ?? '—'} slots
-			</span>
+			<span class="activity">{activityText}</span>
 		</div>
-	</section>
-
-	<section class="card" aria-label="Session totals">
-		<h2>Session</h2>
-		<div class="grid4">
-			<div class="tile">
-				<div class="section-label">Completed</div>
-				<div class="num">{status?.stats?.chunks_completed ?? 0}</div>
-			</div>
-			<div class="tile">
-				<div class="section-label">Verified</div>
-				<div class="num">{status?.stats?.chunks_verified ?? 0}</div>
-			</div>
-			<div class="tile">
-				<div class="section-label">Failed</div>
-				<div class="num">{status?.stats?.chunks_failed ?? 0}</div>
-			</div>
-			<div class="tile">
-				<div class="section-label">Staged</div>
-				<div class="num">{fmtBytes(status?.stats?.bytes_staged)}</div>
-			</div>
-		</div>
-	</section>
-
-	<section class="card" aria-label="Current leases">
-		<h2>Leases</h2>
-		{#if status?.slots?.length}
+		<p class="fine">
+			{status?.dry_run ? 'dry run — staged locally, nothing submitted' : 'live run'} ·
+			{status?.staging ?? '—'} ·
+			{status?.concurrency ?? '—'} slots
+		</p>
+		{#if slots.length}
 			<div class="leases">
-				{#each status.slots as slot (slot.slot)}
+				{#each slots as s (s.slot)}
+					{@const elapsed = leaseElapsed(s.slot)}
 					<div class="slot">
-						<span class="pill {slot.activity}">{slot.activity} #{slot.slot}</span>
-						<span class="ids">
-							{#if slot.target_key}
-								<b>{slot.target_key}</b> · {slot.chunk_type ?? '—'}
-							{:else if slot.chunk_id}
-								<b>{shortId(slot.chunk_id)}</b> · {slot.chunk_type ?? '—'}
-							{:else}
-								{slot.chunk_type ?? 'no lease held'}
-							{/if}
-						</span>
+						<span class="pill {s.activity}">{s.activity} #{s.slot}</span>
+						<span class="ids">{slotText(s)}</span>
+						{#if elapsed != null}
+							<span class="elapsed">{fmtElapsed(elapsed)}</span>
+						{/if}
 					</div>
 				{/each}
 			</div>
 		{:else}
-			<p class="empty">No active lease.</p>
+			<p class="empty">No slots yet — Start begins the run loop.</p>
 		{/if}
 	</section>
 
+	<section class="card" aria-label="Contribution totals">
+		<h2>My contribution</h2>
+		<div class="grid4">
+			<div class="tile">
+				<div class="section-label">Completed</div>
+				<div class="num">{fmtNum(status?.stats?.chunks_completed)}</div>
+			</div>
+			<div class="tile">
+				<div class="section-label">Verified</div>
+				<div class="num">{fmtNum(status?.stats?.chunks_verified)}</div>
+			</div>
+			<div class="tile">
+				<div class="section-label">Failed</div>
+				<div class="num">{fmtNum(status?.stats?.chunks_failed)}</div>
+			</div>
+			<div class="tile">
+				<div class="section-label">Bytes staged</div>
+				<div class="num">{fmtBytes(status?.stats?.bytes_staged)}</div>
+			</div>
+		</div>
+		<div class="meta-rows">
+			<div class="meta-row">
+				<span>Session uptime</span>
+				<b>{fmtUptime(status?.stats?.uptime_secs)}</b>
+			</div>
+			<div class="meta-row">
+				<span>Total runtime, all sessions</span>
+				<b>{fmtUptime(status?.total_runtime_secs)}</b>
+			</div>
+		</div>
+	</section>
+
+	{#if community}
+		<p class="community" role="status">
+			Community total —
+			<b>{fmtNum(community.chunks_verified)}</b> chunks verified ·
+			<b>{fmtNum(community.chunks_pending)}</b> pending ·
+			<b>{fmtNum(community.warriors_online)}/{fmtNum(community.warriors_total)}</b> volunteers online
+		</p>
+	{/if}
+
 	<div class="controls">
 		<button class="primary" onclick={primaryAction} disabled={busy || phase === 'starting' || phase === 'stopping'}>
-			{primaryLabel}
+			{primaryLabel()}
 		</button>
-		<button onclick={register} disabled={busy || phase === 'running' || phase === 'starting' || !view?.credentials_present && false}>
+		<button onclick={register} disabled={busy || phase === 'running' || phase === 'starting'}>
 			Register
 		</button>
 		<button class="danger" onclick={quit} disabled={busy}>Quit</button>
@@ -274,6 +409,10 @@
 
 	<footer>
 		<span>app v{status?.gui_version ?? '0.1.0'} · lib v{status?.client_version ?? '—'}</span>
-		<span>uptime {fmtUptime(status?.stats?.uptime_secs)}</span>
+		{#if inTauri}
+			<span>closing minimizes to tray</span>
+		{:else}
+			<span class="demo-tag" role="status">demo mode — synthetic data (run npm run tauri dev for live values)</span>
+		{/if}
 	</footer>
 </main>

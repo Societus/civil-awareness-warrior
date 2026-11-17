@@ -7,3 +7,4 @@ src-tauri/gen/
 .DS_Store
 *.log
 .env
+.harness/page.client.js

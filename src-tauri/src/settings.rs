@@ -87,3 +87,55 @@ pub fn write(dir: &Path, s: &GuiSettings) -> Result<(), String> {
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Cross-session runtime total (runtime.json)
+// ---------------------------------------------------------------------------
+
+/// Total contributor-loop runtime summed across every session (app restarts
+/// and pause/resume cycles included). The GUI accumulates wall time spent
+/// with an unfinished `Runner` and re-seeds from this file on next launch,
+/// since the lib's `StatsSnapshot::uptime` is per-Runner.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RuntimeState {
+    pub total_runtime_secs: u64,
+}
+
+pub fn runtime_path(dir: &Path) -> std::path::PathBuf {
+    dir.join("runtime.json")
+}
+
+pub fn load_runtime(dir: &Path) -> RuntimeState {
+    fs::read_to_string(runtime_path(dir))
+        .ok()
+        .and_then(|t| serde_json::from_str::<RuntimeState>(&t).ok())
+        .unwrap_or_default()
+}
+
+pub fn write_runtime(dir: &Path, s: &RuntimeState) -> Result<(), String> {
+    fs::create_dir_all(dir).map_err(|e| format!("could not create app data dir: {e}"))?;
+    let path = runtime_path(dir);
+    let json = serde_json::to_string_pretty(s).expect("runtime state serialize");
+    fs::write(&path, json).map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_roundtrip_and_missing_file_defaults() {
+        let dir = std::env::temp_dir().join("lhc-gui-runtime-test");
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(load_runtime(&dir).total_runtime_secs, 0);
+        write_runtime(&dir, &RuntimeState { total_runtime_secs: 123 }).expect("write");
+        assert_eq!(load_runtime(&dir).total_runtime_secs, 123);
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

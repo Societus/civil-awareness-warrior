@@ -2059,6 +2059,7 @@ name = "lh-contributor-gui"
 version = "0.1.0"
 dependencies = [
  "lh-contributor-client",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tauri",
