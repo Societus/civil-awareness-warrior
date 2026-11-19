@@ -11,7 +11,7 @@
 use lh_contributor_client::api::ChunkType;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub const DEFAULT_COORDINATOR: &str = "https://cap.landhunter.app";
 
@@ -559,6 +559,15 @@ impl GuiSettings {
                 }
             }
         }
+        // The Advanced llama-server override is executed by the sidecar
+        // (capture_version pre-run, then spawn_sidecar) — when set it must
+        // be an absolute path to a regular, executable file named
+        // llama-server(.exe on Windows) with no symlink anywhere in its
+        // components, or the save is rejected and the message lands in the
+        // settings dialog under the local_model field.
+        if !self.local_model.llama_server_bin.trim().is_empty() {
+            validate_llama_server_bin(self.local_model.llama_server_bin.trim())?;
+        }
         // Invariant: classify follows the model mode. merge_settings keeps
         // them aligned; this catches hand-edited settings.json drift.
         // (Drift = classify is ON exactly when the mode is None.)
@@ -570,6 +579,60 @@ impl GuiSettings {
         }
         Ok(())
     }
+}
+
+/// Validate the Advanced `llama_server_bin` override. When set it must be
+/// an absolute path to a regular, executable file whose final component is
+/// named `llama-server` (`llama-server.exe` on Windows), with no symlink
+/// anywhere in its components — the sidecar execs this path (capture_version
+/// pre-run, then spawn_sidecar), so an override must never resolve through
+/// a symlink an attacker controls.
+fn validate_llama_server_bin(path: &str) -> Result<(), FieldError> {
+    let p = Path::new(path);
+    let err = |msg: &str| {
+        FieldError::new(
+            "local_model",
+            format!("llama-server binary override: {msg}"),
+        )
+    };
+    if !p.is_absolute() {
+        return Err(err("must be an absolute path"));
+    }
+    let expected = crate::sidecar::main_exe_name();
+    // Walk every component (parents and the file itself): none may be a
+    // symlink. symlink_metadata does not follow links, so a symlinked
+    // directory component is caught here too.
+    let mut prefix = PathBuf::new();
+    let mut final_meta = None;
+    for component in p.components() {
+        prefix.push(component);
+        let meta = match fs::symlink_metadata(&prefix) {
+            Ok(m) => m,
+            Err(e) => return Err(err(&format!("cannot stat '{prefix:?}': {e}"))),
+        };
+        if meta.file_type().is_symlink() {
+            return Err(err(
+                &format!("path component '{prefix:?}' is a symlink and symlinks are not allowed"),
+            ));
+        }
+        final_meta = Some(meta);
+    }
+    let meta = final_meta.expect("a non-empty path always has a final component");
+    if !meta.file_type().is_file() {
+        return Err(err("must point at a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o111 == 0 {
+            return Err(err("must have the executable bit set"));
+        }
+    }
+    match p.file_name().and_then(|name| name.to_str()) {
+        Some(name) if name.ends_with(expected) => {}
+        _ => return Err(err(&format!("file name must end in '{expected}'"))),
+    }
+    Ok(())
 }
 
 pub fn settings_path(dir: &Path) -> std::path::PathBuf {
@@ -585,6 +648,17 @@ pub fn load_or_create(dir: &Path) -> Result<GuiSettings, String> {
                 // file (no local_model / classify) or a hand-edited one
                 // (classify without a model mode) lands consistent.
                 s.normalize_local_model();
+                // A stored llama-server override that no longer validates
+                // (moved, exec bit revoked, symlink swapped in) must not be
+                // silently executed by the sidecar: drop it back to the
+                // default and keep loading, with a warning.
+                let bin = s.local_model.llama_server_bin.trim().to_string();
+                if !bin.is_empty() && validate_llama_server_bin(&bin).is_err() {
+                    eprintln!(
+                        "settings.json llama-server binary override {bin:?} failed validation — clearing it (fix the path under Settings ▸ Local Model ▸ Advanced)"
+                    );
+                    s.local_model.llama_server_bin = String::new();
+                }
                 return Ok(s);
             }
             Err(e) => eprintln!("settings.json corrupt ({e}); writing defaults"),
@@ -1124,5 +1198,137 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&legacy_dir);
+    }
+
+    #[test]
+    fn llama_server_bin_validation_accepts_only_a_real_executable_binary() {
+        let dir = std::env::temp_dir().join("lhc-settings-bin-validation");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // A real, executable, non-symlinked file named llama-server passes.
+        let good = dir.join("llama-server");
+        fs::write(&good, b"#!/bin/sh\necho fake\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&good, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert!(validate_llama_server_bin(good.to_str().unwrap()).is_ok(), "valid override accepted");
+
+        // Relative path rejected.
+        let err = validate_llama_server_bin("bin/llama-server").unwrap_err();
+        assert_eq!(err.field, "local_model", "relative path is refused");
+
+        // Nonexistent path rejected.
+        let missing = dir.join("no-such-dir").join("llama-server");
+        let err = validate_llama_server_bin(missing.to_str().unwrap()).unwrap_err();
+        assert_eq!(err.field, "local_model", "nonexistent path is refused");
+
+        // Non-executable regular file rejected (unix only — the bit doesn't
+        // exist on Windows, so the check is cfg-gated like the implementation).
+        #[cfg(unix)]
+        {
+            let not_exec = dir.join("llama-server-notexec");
+            fs::write(&not_exec, b"not a binary\n").unwrap();
+            let err = validate_llama_server_bin(not_exec.to_str().unwrap()).unwrap_err();
+            assert_eq!(err.field, "local_model", "non-executable file is refused");
+        }
+
+        // Wrong file name rejected even when everything else is fine.
+        let bad_name = dir.join("grep");
+        fs::write(&bad_name, b"x\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&bad_name, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let err = validate_llama_server_bin(bad_name.to_str().unwrap()).unwrap_err();
+        assert_eq!(err.field, "local_model", "wrong file name is refused");
+
+        // A symlink to a valid binary is rejected — the final component is a link.
+        #[cfg(unix)]
+        {
+            let link = dir.join("llama-server-link");
+            std::os::unix::fs::symlink(&good, &link).unwrap();
+            let err = validate_llama_server_bin(link.to_str().unwrap()).unwrap_err();
+            assert_eq!(err.field, "local_model", "symlinked binary is refused");
+        }
+
+        // A symlinked directory component is rejected even though the target
+        // file itself is real, executable, and correctly named.
+        #[cfg(unix)]
+        {
+            let real_dir = dir.join("real-dir");
+            fs::create_dir(&real_dir).unwrap();
+            let real_bin = real_dir.join("llama-server");
+            fs::write(&real_bin, b"x\n").unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&real_bin, fs::Permissions::from_mode(0o755)).unwrap();
+            let link_dir = dir.join("linked-dir");
+            std::os::unix::fs::symlink(&real_dir, &link_dir).unwrap();
+            let err = validate_llama_server_bin(link_dir.join("llama-server").to_str().unwrap()).unwrap_err();
+            assert_eq!(err.field, "local_model", "symlinked path component is refused");
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_path_drops_invalid_llama_server_bin_to_default() {
+        let dir = std::env::temp_dir().join("lhc-settings-load-bin-test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // An invalid override stored on disk (relative path) must not block
+        // load: it is dropped back to the default with a warning, and the
+        // merged settings still validate.
+        fs::write(
+            settings_path(&dir),
+            r#"{"coordinator_url":"https://example.test","public_key_hex":"","concurrency":2,"dry_run":true,"capabilities":{"examination":true,"ingest":true,"alt_source":true,"state_walk":true,"search":true,"classify":false},"schedule":{"enabled":false,"active_from":"09:00","active_until":"17:00"},"local_model":{"mode":"none","llama_server_bin":"bin/llama-server"},"autostart":false}"#,
+        )
+        .expect("seed");
+        let s = load_or_create(&dir).expect("load");
+        assert_eq!(
+            s.local_model.llama_server_bin,
+            "",
+            "invalid override is dropped to the default on load"
+        );
+        assert!(s.validate().is_ok(), "loaded settings validate clean");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_path_keeps_valid_llama_server_bin() {
+        let dir = std::env::temp_dir().join("lhc-settings-load-bin-valid-test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("llama-server");
+        fs::write(&good, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&good, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fs::write(
+            settings_path(&dir),
+            format!(
+                r#"{{
+  "coordinator_url": "https://example.test",
+  "public_key_hex": "",
+  "concurrency": 2,
+  "dry_run": true,
+  "capabilities": {{"examination": true, "ingest": true, "alt_source": true, "state_walk": true, "search": true, "classify": false}},
+  "schedule": {{"enabled": false, "active_from": "09:00", "active_until": "17:00"}},
+  "local_model": {{"mode": "none", "llama_server_bin": "{}"}},
+  "autostart": false
+}}"#,
+                good.display()
+            ),
+        )
+        .expect("seed");
+        let s = load_or_create(&dir).expect("load");
+        assert_eq!(s.local_model.llama_server_bin, good.to_str().unwrap(), "valid override survives load");
+        assert!(s.validate().is_ok());
+        let _ = fs::remove_dir_all(&dir);
     }
 }
