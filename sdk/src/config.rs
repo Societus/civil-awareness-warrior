@@ -28,7 +28,10 @@ pub enum ConfigError {
 /// Collapses the GUI's three modes onto one surface: auto-configured
 /// sidecar (base_url = local llama-server), custom local endpoint, or a
 /// cloud OpenAI-compatible provider (base_url + api_key).
-#[derive(Debug, Clone)]
+///
+/// `api_key` is a credential: `Debug` is deliberately NOT derived so it can
+/// never be formatted by a careless `{:?}`/log path.
+#[derive(Clone)]
 pub struct LlmConfig {
     /// OpenAI-compatible base URL (…/v1). Default http://127.0.0.1:8081/v1
     /// (the llama-server sidecar port).
@@ -125,7 +128,10 @@ fn env_nonempty(var: &'static str) -> Option<String> {
 }
 
 /// Where uploaded blobs go.
-#[derive(Debug, Clone)]
+///
+/// `R2::secret_access_key` is a credential: `Debug` is deliberately NOT
+/// derived so it can never be formatted by a careless `{:?}`/log path.
+#[derive(Clone)]
 pub enum StagingConfig {
     /// PUT to a presigned URL template; `{key}` is replaced with the
     /// URI-encoded blob key. Use when a coordinator/operator hands out
@@ -142,7 +148,11 @@ pub enum StagingConfig {
     Local { root: PathBuf },
 }
 
-#[derive(Debug, Clone)]
+/// The persisted client configuration.
+///
+/// `credentials` and `brave_api_key` are credentials: `Debug` is deliberately
+/// NOT derived so they can never be formatted by a careless `{:?}`/log path.
+#[derive(Clone)]
 pub struct Config {
     /// Coordinator base URL, e.g. `https://lh-tracker.example.workers.dev`.
     pub coordinator_url: String,
@@ -292,16 +302,24 @@ fn load_credentials(work_dir: &Path) -> Result<Option<Credentials>, ConfigError>
 
 /// Save freshly-minted credentials to `{work_dir}/credentials.json` with
 /// 0600 permissions (unix; best effort elsewhere).
+///
+/// The file is written to a temp file in the same directory, chmodded 0600
+/// and then atomically renamed over the target: the file is never visible
+/// with lax permissions (the write-then-chmod window is closed), and a chmod
+/// failure is fatal (`Err`) rather than silently ignored (`let _ =`).
 pub fn save_credentials(work_dir: &Path, creds: &Credentials) -> Result<PathBuf, ConfigError> {
     fs::create_dir_all(work_dir)?;
     let path = work_dir.join("credentials.json");
     let json = serde_json::to_string_pretty(creds).expect("credentials serialize");
-    fs::write(&path, json)?;
+    let temp_path = work_dir.join(format!(".credentials.json.tmp.{}", std::process::id()));
+    fs::write(&temp_path, &json)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+        fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o600))
+            .map_err(ConfigError::Io)?;
     }
+    fs::rename(&temp_path, &path).map_err(ConfigError::Io)?;
     Ok(path)
 }
 
@@ -369,5 +387,69 @@ mod tests {
         assert!(validate_public_key(&"ab".repeat(32)).is_ok());
         assert!(validate_public_key("zz").is_err());
         assert!(validate_public_key(&"ab".repeat(31)).is_err());
+    }
+
+    #[test]
+    fn save_credentials_writes_0600_and_leaves_no_temp_file() {
+        let dir = std::env::temp_dir().join("lhc-save-creds-test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let creds = Credentials {
+            client_id: "c1".to_string(),
+            auth_token: "***".to_string(),
+        };
+        let path = save_credentials(&dir, &creds).expect("save");
+        assert!(path.exists());
+        let text = fs::read_to_string(&path).expect("read");
+        assert_eq!(
+            text,
+            "{\n  \"client_id\": \"c1\",\n  \"auth_token\": \"***\"\n}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "credentials file must be 0600");
+        }
+        // The temp file must be renamed away, not left behind.
+        let leftover: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".credentials.json.tmp.")
+            })
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "temp file must be renamed away, got {leftover:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_credentials_propagates_io_errors_instead_of_silently_ignoring() {
+        let dir = std::env::temp_dir().join("lhc-save-creds-fail-test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        // Read-only dir: the temp write / chmod / rename cannot succeed. The
+        // error must surface as Err (the chmod failure is no longer dropped
+        // with `let _ =`).
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let creds = Credentials {
+            client_id: "c1".to_string(),
+            auth_token: "***".to_string(),
+        };
+        let err = save_credentials(&dir, &creds).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Io(_)),
+            "expected Io error, got {err:?}"
+        );
+        // Restore permissions so the temp dir can be removed.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = fs::remove_dir_all(&dir);
     }
 }

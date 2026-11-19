@@ -346,20 +346,24 @@ pub struct RegisterRequest {
     pub llm: Option<LlmCapability>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct RegisterResponse {
     pub client_id: String,
     pub auth_token: String,
 }
 
 /// Saved identity minted by `POST /v1/register`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is deliberately NOT derived: `auth_token` is a secret and must
+/// never be formatted by a careless `{:?}`/log path. Serialization uses
+/// `Serialize`/`Deserialize` only.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Credentials {
     pub client_id: String,
     pub auth_token: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct HeartbeatRequest {
     pub lease_id: String,
     pub client_id: String,
@@ -422,7 +426,7 @@ impl std::fmt::Display for FailureType {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct FailRequest {
     pub lease_id: String,
     pub client_id: String,
@@ -457,7 +461,7 @@ pub struct WorkerManifest {
     pub extra: Map<String, Value>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct ResultSubmit {
     pub chunk_id: String,
     pub client_id: String,

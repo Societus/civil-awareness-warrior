@@ -139,7 +139,7 @@ async fn register_rate_limit_maps_retry_after() {
         .mount(&server)
         .await;
 
-    let err = client(&server)
+    let err = match client(&server)
         .register(&RegisterRequest {
             platform: "p".to_string(),
             version: "0.1.0".to_string(),
@@ -147,7 +147,11 @@ async fn register_rate_limit_maps_retry_after() {
             llm: None,
         })
         .await
-        .unwrap_err();
+    {
+        Err(err) => err,
+        // A successful register would mean the mock misconfigured; fail loud.
+        Ok(_) => panic!("expected register to fail with rate limit"),
+    };
     match err {
         ApiError::RateLimited {
             retry_after_sec: Some(720),
