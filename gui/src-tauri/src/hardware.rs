@@ -1,15 +1,18 @@
-//! "Can I AI?" — the click-only, read-only hardware advisor (t_10daf382).
+//! "Can I AI?" — the read-only hardware advisor (t_10daf382).
 //!
 //! Doctrine (operator-stated, non-negotiable):
-//! - Runs ONLY when the volunteer clicks "Can I AI?" in Settings ▸ Local
-//!   Model. No startup probe, no background task, no polls — nothing in
-//!   this module is imported by the run loop or by any watcher/monitor.
-//! - Read-only and unprivileged: /proc/meminfo, /sys/class/drm sysfs,
-//!   `nvidia-smi` (query only), `sysctl -n` (read only), DXGI adapter
-//!   enumeration + GlobalMemoryStatusEx (Windows). These are queries of
-//!   already-present system state, never helper daemons; nothing here
-//!   installs drivers, attempts elevation, spawns long-lived processes,
-//!   or writes a single byte.
+//! - Probes run on the volunteer's explicit "Can I AI?" click in Settings
+//!   ▸ Local Model, and implicitly whenever the local-model sidecar backend
+//!   is selected: `auto_backend` probes the GPU to pick Vulkan vs CPU on
+//!   Start/Resume, and the sidecar safety monitor re-runs that selection
+//!   (respawn ~10 s) whenever it restarts a dead sidecar. The probe is still
+//!   read-only: it reads already-present system state and never installs
+//!   drivers, attempts elevation, spawns long-lived processes, or writes
+//!   state.
+//! - Read-only and unprivileged sources: /proc/meminfo, /sys/class/drm
+//!   sysfs, `nvidia-smi` (query only), `sysctl -n` (read only), DXGI
+//!   adapter enumeration + GlobalMemoryStatusEx (Windows). These are queries
+//!   of already-present system state, never helper daemons.
 //! - Results stay on the machine: the report is rendered straight into the
 //!   Settings dialog and never persisted, uploaded, or logged.
 //! - Honest verdicts only: an inconclusive probe yields the honest

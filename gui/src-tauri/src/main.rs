@@ -16,8 +16,8 @@ use tauri::{Emitter, Manager, WindowEvent};
 fn main() {
     tauri::Builder::default()
         // "Can I AI?" advisor links open in the system browser through the
-        // opener plugin; the capability scopes it to huggingface.co only
-        // (capabilities/default.json). No other URL can be opened.
+        // opener plugin; the capability scopes it to huggingface.co and
+        // github.com (capabilities/default.json). No other URL can be opened.
         .plugin(tauri_plugin_opener::init())
         // Launch-at-login (card t_f9279e25): the plugin owns the OS entry —
         // HKCU Run value (Windows), XDG autostart .desktop (Linux,

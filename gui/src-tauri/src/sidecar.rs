@@ -301,17 +301,15 @@ pub fn endpoint_port(cfg: &LocalModelCfg) -> u16 {
 
 fn host_is_local(url: &Url) -> bool {
     match url.host() {
-        Some(url::Host::Domain(d)) => d == "localhost" || d.ends_with(".local"),
-        Some(url::Host::Ipv4(v4)) => {
-            let o = v4.octets();
-            // 127/8 loopback + RFC1918 private ranges (a volunteer's LAN
-            // llama-server/vLLM is still "local", not a third party).
-            o[0] == 127 || o[0] == 10 || (o[0] == 172 && (16..=31).contains(&o[1])) || (o[0] == 192 && o[1] == 168)
-        }
-        Some(url::Host::Ipv6(v6)) => {
-            let s = v6.to_string();
-            s == "::1" || s.starts_with("fe80") || s.starts_with("fc") || s.starts_with("fd")
-        }
+        // True loopback only: 127/8, ::1, and the "localhost" domain. A
+        // volunteer's LAN server (10/8, 172.16/12, 192.168/16, .local, IPv6
+        // link-local/ULA) is NOT loopback — it is a third-party endpoint from
+        // this machine's perspective and is treated as `cloud`. This keeps
+        // host_is_local honest and makes the Auto-mode endpoint rule in
+        // settings::validate ("127.0.0.1/localhost http URL") accurate.
+        Some(url::Host::Domain(d)) => d == "localhost",
+        Some(url::Host::Ipv4(v4)) => v4.octets()[0] == 127,
+        Some(url::Host::Ipv6(v6)) => v6.to_string() == "::1",
         None => false,
     }
 }
@@ -1772,7 +1770,7 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_kind_honesty_loopback_lan_cloud() {
+    fn endpoint_kind_honesty_loopback_only() {
         use lh_contributor_client::api::LlmEndpointKind;
         assert_eq!(
             custom_endpoint_kind("http://127.0.0.1:8081/v1"),
@@ -1782,14 +1780,15 @@ mod tests {
             custom_endpoint_kind("http://localhost:1234/v1"),
             LlmEndpointKind::CustomLocal
         );
+        // Only true loopback is `custom-local`; a volunteer's LAN server is
+        // a third-party endpoint from this machine's perspective → `cloud`.
         assert_eq!(
             custom_endpoint_kind("http://192.168.4.20:8080/v1"),
-            LlmEndpointKind::CustomLocal,
-            "a volunteer's LAN server is still 'local'"
+            LlmEndpointKind::Cloud
         );
         assert_eq!(
             custom_endpoint_kind("http://10.0.0.5:8080/v1"),
-            LlmEndpointKind::CustomLocal
+            LlmEndpointKind::Cloud
         );
         assert_eq!(
             custom_endpoint_kind("https://api.example-provider.com/v1"),
