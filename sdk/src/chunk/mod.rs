@@ -20,6 +20,7 @@ use crate::error::ChunkFailure;
 use crate::llm::LlmLane;
 use crate::rate::RateLimiter;
 use crate::staging::BlobStager;
+use futures_util::{stream::Stream, StreamExt as _};
 use std::sync::Arc;
 use tokio::sync::watch;
 
@@ -154,11 +155,49 @@ pub(crate) fn failure_for_transport(err: &reqwest::Error, url: &str) -> ChunkFai
 }
 
 /// One fetched page, post status/content-type validation.
+#[derive(Debug)]
 pub(crate) struct FetchedPage {
     pub requested_url: String,
     pub final_url: String,
     pub content_type: Option<String>,
     pub bytes: Vec<u8>,
+}
+
+/// Hard cap on a single fetched page body: never buffer unbounded.
+/// 16 MiB is ample for any source page (GIS parcel HTML, CSVs, rosters);
+/// anything larger is a misconfigured contract or an abuse attempt, so we
+/// reject it with a clear error instead of allocating without limit.
+pub(crate) const MAX_BODY_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Read a response body stream, enforcing [`MAX_BODY_BYTES`] so a malicious
+/// or broken source can never make us buffer an unbounded body in memory.
+/// Returns a clear [`FailureType::ClientError`] when the source exceeds the
+/// cap. Transport errors mid-stream map to the usual transport failure.
+async fn read_capped_body<B, S>(
+    mut stream: S,
+    url: &str,
+) -> Result<Vec<u8>, ChunkFailure>
+where
+    S: Stream<Item = Result<B, reqwest::Error>> + Unpin,
+    B: AsRef<[u8]>,
+{
+    let mut buf = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| failure_for_transport(&e, url))?;
+        let chunk_len = chunk.as_ref().len();
+        let remaining = MAX_BODY_BYTES as usize - buf.len();
+        if chunk_len > remaining {
+            return Err(ChunkFailure::new(
+                FailureType::ClientError,
+                format!(
+                    "response body exceeds {MAX_BODY_BYTES} byte cap at {url}; \
+                     refusing to buffer unbounded"
+                ),
+            ));
+        }
+        buf.extend_from_slice(chunk.as_ref());
+    }
+    Ok(buf)
 }
 
 /// Polite fetch with rate limiting, status mapping and content-type checks.
@@ -197,6 +236,11 @@ pub(crate) async fn fetch_page(
     }
 
     let resp = req
+        // Redirect policy (Policy::none) is pinned on the http client at
+        // construction (runner.rs `source_http`): any 3xx is rejected rather
+        // than followed, so a compromised source can never redirect the
+        // client off-host (SSRF / host-drift). The contracted URL is the
+        // final destination; operators must put final URLs in contracts.
         .send()
         .await
         .map_err(|e| failure_for_transport(&e, url))?;
@@ -218,11 +262,7 @@ pub(crate) async fn fetch_page(
         }
     }
     let final_url = resp.url().to_string();
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| failure_for_transport(&e, url))?
-        .to_vec();
+    let bytes = read_capped_body(resp.bytes_stream(), url).await?;
     ctx.limiter.record_bytes(bytes.len() as u64).await;
     Ok(FetchedPage {
         requested_url: url.to_string(),
@@ -277,5 +317,140 @@ mod tests {
         assert!(!failure_for_status(404, "u").failure_type.is_retryable());
         assert!(failure_for_status(503, "u").failure_type.is_retryable());
         assert!(failure_for_status(403, "u").failure_type.is_retryable());
+    }
+
+    use crate::staging::LocalStager;
+    use reqwest::redirect::Policy;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn test_ctx() -> ExecContext {
+        let (lost_tx, lost_rx) = watch::channel(false);
+        std::mem::forget(lost_tx); // never lost in these tests
+        ExecContext {
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .redirect(Policy::none()) // contracted URL is the final destination
+                .build()
+                .unwrap(),
+            limiter: Arc::new(RateLimiter::new(10_000, 1_000_000_000)),
+            stager: Arc::new(LocalStager::new(
+                std::env::temp_dir().join("lhc-chunk-fetch-test"),
+            )) as Arc<dyn BlobStager>,
+            lease: LeaseContext {
+                lease_id: "lease-1".to_string(),
+                chunk_id: "chunk-1".to_string(),
+                target_key: "WI/55011".to_string(),
+                staging_upload_prefix: "stage/raw/test/wi/55011/lease-1/".to_string(),
+            },
+            user_agent: "lh-contributor/test".to_string(),
+            brave_api_key: None,
+            llm: None,
+            search_proxy: None,
+            lease_lost: lost_rx,
+            dry_run: true,
+        }
+    }
+
+    /// 16 MiB cap: an oversized body is refused with a clear error and never
+    /// buffered without bound.
+    #[tokio::test]
+    async fn fetch_page_rejects_body_over_cap() {
+        let server = MockServer::start().await;
+        let over = vec![0u8; MAX_BODY_BYTES as usize + 1];
+        Mock::given(method("GET"))
+            .and(path("/oversized"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                over.clone(),
+                "application/octet-stream",
+            ))
+            .mount(&server)
+            .await;
+        let ctx = test_ctx();
+        let err = fetch_page(
+            &ctx,
+            reqwest::Method::GET,
+            &format!("{}/oversized", server.uri()),
+            &[],
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.details.contains(&MAX_BODY_BYTES.to_string()),
+            "cap message must name the limit, got: {err}"
+        );
+        assert!(
+            err.details.contains("unbounded"),
+            "cap message must refuse unbounded buffering, got: {err}"
+        );
+    }
+
+    /// A body under the cap still fetches fine.
+    #[tokio::test]
+    async fn fetch_page_accepts_body_under_cap() {
+        let server = MockServer::start().await;
+        let body = b"small page";
+        Mock::given(method("GET"))
+            .and(path("/small"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                body.to_vec(),
+                "text/plain",
+            ))
+            .mount(&server)
+            .await;
+        let ctx = test_ctx();
+        let page = fetch_page(
+            &ctx,
+            reqwest::Method::GET,
+            &format!("{}/small", server.uri()),
+            &[],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(page.bytes, body);
+    }
+
+    /// Redirect policy: Policy::none() means a 3xx is rejected rather than
+    /// followed, so the client is never steered off the contracted host.
+    #[tokio::test]
+    async fn fetch_page_refuses_redirect() {
+        let source = MockServer::start().await;
+        let target = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/redirect"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header(
+                    "Location",
+                    format!("{}/final", target.uri()),
+                ),
+            )
+            .mount(&source)
+            .await;
+        // The target must never be observed — if the redirect were followed
+        // it would return 200 with this body.
+        Mock::given(method("GET"))
+            .and(path("/final"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                b"target".to_vec(),
+                "text/plain",
+            ))
+            .mount(&target)
+            .await;
+        let ctx = test_ctx();
+        let err = fetch_page(
+            &ctx,
+            reqwest::Method::GET,
+            &format!("{}/redirect", source.uri()),
+            &[],
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(!err.details.is_empty(), "redirect must be refused, not followed");
     }
 }

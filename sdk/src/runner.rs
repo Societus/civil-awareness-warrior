@@ -25,6 +25,7 @@ use crate::staging::{build_stager, BlobStager};
 use crate::stats::{SlotActivity, StatsHandle};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
+use reqwest::redirect::Policy;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -221,6 +222,11 @@ impl Runner {
 
         let source_http = reqwest::Client::builder()
             .timeout(Duration::from_secs(cfg.http_timeout_secs))
+            // Redirect policy: Policy::none() — the contracted source URL is
+            // the final destination; any 3xx is rejected rather than followed,
+            // so a compromised source cannot redirect the client off-host
+            // (SSRF / host-drift). Operators must use final URLs in contracts.
+            .redirect(Policy::none())
             .build()
             .context("source http client")?;
         let state = Arc::new(RunState {
