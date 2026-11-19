@@ -500,6 +500,22 @@ pub fn spawn_sidecar(
     data_dir: &Path,
     spec: &ModelSpec,
 ) -> Result<Child, String> {
+    // Gate (cand_7acb443): if the trust record says needs_reinstall, refuse
+    // to launch. The record is the gate — we do NOT re-hash on every spawn.
+    // A failed promotion left bin/ rolled back to the old files; the record
+    // says so, and spawn must not pair those old files with a new binary.
+    if let Some(state) = load_bin_state(data_dir) {
+        if state.needs_reinstall {
+            let detail = state.error.as_deref().unwrap_or("update failed");
+            return Err(format!(
+                "llama-server install under bin/ is marked needs-reinstall ({detail}) — \
+                 the previous promotion rolled back and the install is not trusted. \
+                 Re-run Local Model acquisition to re-download and verify the pinned \
+                 release, or point Settings ▸ Local Model ▸ Advanced at your own binary."
+            ));
+        }
+    }
+
     let bin = resolve_binary(&cfg.llama_server_bin, data_dir).ok_or_else(|| {
         if !cfg.llama_server_bin.trim().is_empty() {
             format!(
@@ -1170,6 +1186,12 @@ pub struct BinDownloadState {
     /// `llama-server --version` first line, captured at install.
     #[serde(default)]
     pub version: Option<String>,
+    /// The trust record is failed: a mid-promotion rollback restored the
+    /// previous bin/ files, but this update attempt did not complete. Spawn
+    /// is refused until a fresh acquisition re-verifies (cand_7acb443). The
+    /// record is the gate — we do NOT re-hash on every spawn.
+    #[serde(default)]
+    pub needs_reinstall: bool,
 }
 
 pub fn load_bin_state(data_dir: &Path) -> Option<BinDownloadState> {
@@ -1299,48 +1321,138 @@ fn remove_if_present(path: &Path) {
     let _ = fs::remove_file(path);
 }
 
+/// Back up every existing target to a .bak sibling before any rename, then
+/// promote via rename: libs first, binary last. On any mid-promotion error,
+/// roll back: restore overwritten targets from their .bak copies and return
+/// the error. A successful promotion drops the .bak backups.
+///
+/// Binary-last ordering guarantees a partial failure can never leave a new
+/// binary paired with old libraries — the trust record (the caller) decides
+/// whether bin/ is trusted after seeing this result.
 fn promote_all(_staging: &Path, candidates: &[PathBuf], bin: &Path, main_name: &str) -> Result<PathBuf, String> {
-    for src in candidates {
+    // Libs first, binary last: a partial failure must never pair a new
+    // binary with old libraries.
+    let mut ordered: Vec<&PathBuf> = candidates.iter().collect();
+    ordered.sort_by_key(|p| {
+        p.file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            == Some(main_name.to_string())
+    });
+
+    // Phase 1: back up every existing target to a .bak before any rename.
+    // All backups exist before the first promotion, so rollback can restore
+    // any overwritten target.
+    let mut plans: Vec<(PathBuf, Option<PathBuf>)> = Vec::new(); // (dest, bak)
+    for src in &ordered {
         let leaf = src
             .file_name()
             .ok_or_else(|| format!("no file name under {}", src.display()))?
             .to_string_lossy()
             .to_string();
         let dest = bin.join(&leaf);
-        remove_if_present(&dest);
-        if fs::symlink_metadata(src)
-            .map(|m| m.file_type().is_symlink())
-            .unwrap_or(false)
-        {
-            // Re-link by BASENAME into bin/: the real archives link
-            // libX.so → libX.so.1 within their own directory, so a
-            // basename-only link stays valid after flattening. A link
-            // pointing outside the archive is skipped, never followed.
-            let target = fs::read_link(src).map_err(|e| format!("read_link {}: {e}", src.display()))?;
-            let Some(target_leaf) = target.file_name().map(|s| s.to_string_lossy().to_string()) else {
-                continue;
-            };
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(&target_leaf, &dest)
-                .map_err(|e| format!("symlink {leaf} → {target_leaf}: {e}"))?;
-            #[cfg(not(unix))]
-            {
-                let _ = &target_leaf; // no unprivileged symlink creation on Windows; llama.cpp zips need none
-            }
+        let bak = if dest.is_file() || dest.is_symlink() {
+            let bak = dest.with_file_name(format!("{leaf}.bak"));
+            fs::copy(&dest, &bak).map_err(|e| format!("backup {leaf}: {e}"))?;
+            Some(bak)
         } else {
-            fs::rename(src, &dest).map_err(|e| format!("moving {leaf} into place: {e}"))?;
-        }
+            None
+        };
+        plans.push((dest, bak));
     }
+
+    // Phase 2: promote via rename, libs first, binary last.
+    // Track successful promotions for rollback.
+    let mut promoted: Vec<PathBuf> = Vec::new();
+    let phase2: Result<(), String> = (|| {
+        for (i, src) in ordered.iter().enumerate() {
+            let leaf = src
+                .file_name()
+                .ok_or_else(|| format!("no file name under {}", src.display()))?
+                .to_string_lossy()
+                .to_string();
+            let dest = &plans[i].0;
+            let is_symlink = fs::symlink_metadata(src)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false);
+            if is_symlink {
+                // Symlinks can't be atomically replaced via rename; remove the
+                // old one first, then link. On failure, rollback restores from .bak.
+                let target = fs::read_link(src).map_err(|e| format!("read_link {}: {e}", src.display()))?;
+                let Some(target_leaf) = target.file_name().map(|s| s.to_string_lossy().to_string()) else {
+                    continue;
+                };
+                remove_if_present(dest);
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&target_leaf, dest)
+                    .map_err(|e| format!("symlink {leaf} → {target_leaf}: {e}"))?;
+                #[cfg(not(unix))]
+                {
+                    let _ = &target_leaf; // no unprivileged symlink creation on Windows
+                }
+            } else {
+                // Rename atomically replaces dest on the same filesystem; dest
+                // either keeps the old content or gets the new content, never a mix.
+                fs::rename(src, dest).map_err(|e| format!("moving {leaf} into place: {e}"))?;
+            }
+            promoted.push(dest.clone());
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = phase2 {
+        let _ = rollback_promotions(&promoted, &plans);
+        return Err(e);
+    }
+
+    // Phase 3: verify the main binary is in place.
     let main = bin.join(main_name);
     if !main.is_file() {
-        return Err(format!("archive layout changed: no {main_name} was promoted — refusing to run anything"));
+        let _ = rollback_promotions(&promoted, &plans);
+        return Err(format!(
+            "archive layout changed: no {main_name} was promoted — refusing to run anything"
+        ));
     }
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(&main, fs::Permissions::from_mode(0o755));
     }
+
+    // Phase 4: full success — drop the .bak backups.
+    for (_, bak) in &plans {
+        if let Some(bak) = bak {
+            let _ = fs::remove_file(bak);
+        }
+    }
+
     Ok(main)
+}
+
+/// Roll back every successfully promoted destination: remove it, then
+/// restore from its .bak copy (if one was made). Targets whose rename never
+/// ran are left untouched — rename is atomic, so dest either has the old
+/// content or the new content, never a mix. Any leftover .bak files are
+/// removed.
+fn rollback_promotions(
+    promoted: &[PathBuf],
+    plans: &[(PathBuf, Option<PathBuf>)],
+) -> Result<(), String> {
+    let bak_by_dest: std::collections::HashMap<PathBuf, Option<PathBuf>> = plans.iter().cloned().collect();
+    for dest in promoted.iter().rev() {
+        let _ = fs::remove_file(dest);
+        if let Some(Some(bak)) = bak_by_dest.get(dest) {
+            fs::copy(bak, dest).map_err(|e| format!("rollback restore {}: {e}", dest.display()))?;
+            let _ = fs::remove_file(bak);
+        }
+    }
+    // Drop any .bak files for targets that were never reached.
+    for (_, bak) in plans {
+        if let Some(bak) = bak {
+            let _ = fs::remove_file(bak);
+        }
+    }
+    Ok(())
 }
 
 /// `llama-server --version` → first meaningful line, e.g.
@@ -1601,14 +1713,15 @@ pub async fn download_binary(
             Ok(version)
         }
         Err(e) => {
-            // Extraction/self-check failure: staging was discarded and
-            // bin/ was never touched — if a different tag/asset was
-            // already verified, its trust record is restored intact.
-            // The .part is dropped too: the restored (or error) state
-            // won't resume from it, and refusing to run this artifact
-            // shouldn't leave dead weight beside a working install.
+            // Extraction/self-check/promotion failure: bin/ was rolled back
+            // by promote_all (or never touched for pre-promotion failures).
+            // Mark this attempt needs_reinstall so spawn refuses until a
+            // fresh acquisition re-verifies. If a different tag/asset was
+            // already verified, its trust record is restored intact instead
+            // — a failed update never untrusts a working binary.
             let _ = fs::remove_file(&part);
             state.error = Some(e.clone());
+            state.needs_reinstall = true;
             save_bin_failure(data_dir, &state, prior.as_ref(), prior_finished_for_different_asset);
             Err(e)
         }
@@ -2558,6 +2671,7 @@ main()
                 finished: true,
                 error: None,
                 version: Some("version: old (build 55555)".to_string()),
+                needs_reinstall: false,
             },
         );
         assert_eq!(trusted_binary(&data_dir), Some(old_exe.clone()));
@@ -2791,6 +2905,7 @@ main()
                 finished: false,
                 error: Some("previous run was cut off before extraction".to_string()),
                 version: None,
+                needs_reinstall: false,
             },
         );
         // URL deliberately points at a CLOSED port: reaching it would fail
@@ -2832,6 +2947,7 @@ main()
                 finished: false,
                 error: None,
                 version: None,
+                needs_reinstall: false,
             },
         );
         let server = start_fixture_server(vec![(asset.as_str(), tar.clone())]);
@@ -2913,5 +3029,128 @@ main()
             assert_eq!(hex, pinned.sha256, "{} digest drift — re-pin required", pinned.asset);
             assert_eq!(asset.size, pinned.bytes_hint, "{} size drift — re-pin required", pinned.asset);
         }
+    }
+
+    // ---- sidecar promotion atomicity + trust-record gate (t_c56745d1) ----
+
+    #[test]
+    fn promote_all_swaps_libs_then_binary_atomically() {
+        let root = std::env::temp_dir().join("lhc-promote-success");
+        let _ = fs::remove_dir_all(&root);
+        let bin = root.join("bin");
+        let staging = root.join("staging");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&staging).unwrap();
+
+        // Old install.
+        fs::write(bin.join("llama-server"), b"OLD-BINARY").unwrap();
+        fs::write(bin.join("libbase.so"), b"OLD-LIB").unwrap();
+
+        // New versions in staging.
+        fs::write(staging.join("llama-server"), b"NEW-BINARY").unwrap();
+        fs::write(staging.join("libbase.so"), b"NEW-LIB").unwrap();
+
+        let candidates = vec![
+            staging.join("libbase.so"),
+            staging.join("llama-server"),
+        ];
+        let main = promote_all(&staging, &candidates, &bin, "llama-server").unwrap();
+
+        assert_eq!(main, bin.join("llama-server"));
+        assert_eq!(fs::read(bin.join("llama-server")).unwrap(), b"NEW-BINARY");
+        assert_eq!(fs::read(bin.join("libbase.so")).unwrap(), b"NEW-LIB");
+        // .bak backups cleaned up on full success.
+        assert!(!bin.join("libbase.so.bak").exists());
+        assert!(!bin.join("llama-server.bak").exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn promote_all_rolls_back_on_mid_promotion_failure() {
+        let root = std::env::temp_dir().join("lhc-promote-rollback");
+        let _ = fs::remove_dir_all(&root);
+        let bin = root.join("bin");
+        let staging = root.join("staging");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&staging).unwrap();
+
+        // Old install: binary + one lib.
+        fs::write(bin.join("llama-server"), b"OLD-BINARY").unwrap();
+        fs::write(bin.join("libbase.so"), b"OLD-LIB").unwrap();
+
+        // New versions in staging.
+        fs::write(staging.join("llama-server"), b"NEW-BINARY").unwrap();
+        fs::write(staging.join("libbase.so"), b"NEW-LIB").unwrap();
+
+        // Make the binary destination a directory: its rename will fail
+        // (EISDIR) AFTER the lib promotion succeeds — a mid-promotion failure.
+        fs::remove_file(bin.join("llama-server")).unwrap();
+        fs::create_dir_all(bin.join("llama-server")).unwrap();
+
+        let candidates = vec![
+            staging.join("libbase.so"),
+            staging.join("llama-server"),
+        ];
+        let err = promote_all(&staging, &candidates, &bin, "llama-server")
+            .unwrap_err();
+
+        // Rollback restored the old lib from .bak.
+        assert_eq!(
+            fs::read(bin.join("libbase.so")).unwrap(),
+            b"OLD-LIB",
+            "rolled-back lib must retain old content"
+        );
+        // Binary destination was never touched (rename is atomic).
+        assert!(bin.join("llama-server").is_dir(), "binary dest untouched");
+        // No .bak leftovers.
+        assert!(!bin.join("libbase.so.bak").exists(), ".bak cleaned up");
+        assert!(!bin.join("llama-server.bak").exists(), ".bak cleaned up");
+        assert!(err.contains("moving llama-server into place"), "unexpected error: {err}");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn spawn_sidecar_refuses_when_needs_reinstall() {
+        let data_dir = std::env::temp_dir().join("lhc-spawn-gate");
+        let _ = fs::remove_dir_all(&data_dir);
+        let bin = data_dir.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+
+        // Trust record marked needs_reinstall from a failed promotion.
+        save_bin_state(
+            &data_dir,
+            &BinDownloadState {
+                tag: "b99999".to_string(),
+                asset: "llama-b99999-bin-ubuntu-x64.tar.gz".to_string(),
+                backend: "cpu".to_string(),
+                sha256: "0".repeat(64),
+                total_bytes: 10,
+                done_bytes: 10,
+                finished: false,
+                error: Some(
+                    "mid-promotion failure: moving llama-server into place".to_string(),
+                ),
+                version: None,
+                needs_reinstall: true,
+            },
+        );
+
+        let cfg = LocalModelCfg {
+            llama_server_bin: String::new(),
+            ..Default::default()
+        };
+        let err = spawn_sidecar(&cfg, &data_dir, &DEFAULT_MODEL).unwrap_err();
+        assert!(
+            err.contains("needs-reinstall"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.contains("Re-run Local Model acquisition"),
+            "unexpected error: {err}"
+        );
+
+        let _ = fs::remove_dir_all(&data_dir);
     }
 }
