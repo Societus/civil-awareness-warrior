@@ -7,7 +7,10 @@
 # The official rust:alpine image targets musl natively and ships a C
 # toolchain, so zstd-sys's C build needs nothing extra beyond musl-dev.
 
-FROM docker.io/library/rust:1-alpine AS build
+# Build-stage base image pinned by digest so rebuilds are byte-identical and
+# the image is not silently retargeted to a newer rust/alpine patch. Re-pin
+# this digest on every toolchain bump (rust:1-alpine = sha256:2cccd8b212b37dad15a555589c1b6787da4ab913fe24d8a9b2d99d3498869409 at last audit).
+FROM docker.io/library/rust@sha256:2cccd8b212b37dad15a555589c1b6787da4ab913fe24d8a9b2d99d3498869409 AS build
 WORKDIR /src
 RUN apk add --no-cache musl-dev
 COPY Cargo.toml Cargo.lock ./
