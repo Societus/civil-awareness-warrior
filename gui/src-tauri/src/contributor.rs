@@ -90,6 +90,11 @@ const COMMUNITY_RETRY_MS: i64 = 15_000;
 /// Contract lookups attempted per chunk_id before giving up (UI falls back
 /// to the chunk id itself).
 const LEASE_LOOKUP_MAX_ATTEMPTS: u8 = 3;
+/// Ceiling on lease_attempts so a tracker that keeps supplying failing
+/// chunk_ids cannot grow this map without bound (cand_9737add). When full we
+/// evict the longest-retained entries first; attempt counters are only a
+/// backoff hint, so dropping a stale entry loses nothing.
+const LEASE_ATTEMPTS_MAX_ENTRIES: usize = 256;
 /// Why the current pause exists (UiStatus.pause_reason). 0 = not paused.
 pub const PAUSE_USER: u8 = 1;
 pub const PAUSE_SCHEDULE: u8 = 2;
@@ -1286,6 +1291,12 @@ async fn enrich_leases(st: &AppState) {
         }
     }
 
+    // Cap lease_attempts so tracker-supplied failing chunk_ids cannot grow
+    // it without bound (cand_9737add).
+    if guard(&st.lease_attempts).len() > LEASE_ATTEMPTS_MAX_ENTRIES {
+        prune_lease_attempts(st);
+    }
+
     // Keep the cache from growing without bound across a long run.
     if guard(&st.lease_targets).len() > 400 {
         let live: Vec<String> = snap
@@ -1300,6 +1311,19 @@ async fn enrich_leases(st: &AppState) {
             .collect();
         let mut targets = guard(&st.lease_targets);
         targets.retain(|k, _| live.iter().any(|id| id == k));
+    }
+}
+
+/// Evict `lease_attempts` entries until they are back under the cap, dropping
+/// the longest-retained entries first. `lease_attempts` is a plain HashMap so
+/// iteration order is the best available proxy for recency; the cap itself
+/// (not the eviction order) is the security boundary.
+fn prune_lease_attempts(st: &AppState) {
+    let mut attempts = guard(&st.lease_attempts);
+    while attempts.len() > LEASE_ATTEMPTS_MAX_ENTRIES {
+        let key = attempts.keys().next().cloned();
+        let Some(key) = key else { break };
+        attempts.remove(&key);
     }
 }
 
@@ -2337,6 +2361,34 @@ mod tests {
         assert_eq!(runtime_delta(4300, 2), None);
         // Implausible jumps (different/newer Runner snapshot) never retro-add.
         assert_eq!(runtime_delta(10, 10_000), None);
+    }
+
+    #[test]
+    fn lease_attempts_prune_caps_at_max_entries() {
+        let dir = std::env::temp_dir().join("lhc-lease-attempts-prune");
+        let _ = fs::remove_dir_all(&dir);
+        let settings = crate::settings::GuiSettings::defaults_from_env();
+        let st = Arc::new(AppState::new(dir.clone(), settings, None));
+
+        // A tracker that keeps supplying failing chunk_ids must not grow the
+        // map without bound (cand_9737add).
+        for i in 0..(LEASE_ATTEMPTS_MAX_ENTRIES + 50) {
+            st.lease_attempts
+                .lock()
+                .unwrap()
+                .insert(format!("chunk-{i}"), 1);
+        }
+        assert_eq!(
+            st.lease_attempts.lock().unwrap().len(),
+            LEASE_ATTEMPTS_MAX_ENTRIES + 50
+        );
+
+        prune_lease_attempts(&st);
+
+        let n = st.lease_attempts.lock().unwrap().len();
+        assert!(n <= LEASE_ATTEMPTS_MAX_ENTRIES, "map must be capped, got {n}");
+        assert_eq!(n, LEASE_ATTEMPTS_MAX_ENTRIES);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
