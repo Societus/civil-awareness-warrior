@@ -466,7 +466,7 @@ async fn lease_round(
     let started_at = now_ms;
     let (lost_tx, lost_rx) = watch::channel(false);
     let hb_api = state.api.clone();
-    let hb_client_id = creds_snapshot.client_id.clone();
+    let hb_creds = creds_snapshot.clone();
     let hb_lease_id = lease.lease_id.clone();
     let hb_interval = Duration::from_secs(lease.heartbeat_interval_sec.max(15));
     let mut hb_shutdown = state.shutdown_tx.subscribe();
@@ -479,7 +479,7 @@ async fn lease_round(
                 }
             }
             match hb_api
-                .heartbeat(&hb_client_id, &hb_lease_id, Some("executing"))
+                .heartbeat(&hb_creds, &hb_lease_id, Some("executing"))
                 .await
             {
                 Ok(hb) => {
@@ -559,6 +559,7 @@ async fn lease_round(
             let submit = ResultSubmit {
                 chunk_id: lease.chunk_id.clone(),
                 client_id: creds_snapshot.client_id.clone(),
+                auth_token: creds_snapshot.auth_token.clone(),
                 started_at,
                 completed_at,
                 manifest: outcome.manifest,
@@ -614,9 +615,14 @@ async fn lease_round(
 }
 
 async fn report(state: &Arc<RunState>, lease_id: &str, failure_type: FailureType, details: &str) {
+    let (client_id, auth_token) = {
+        let creds = state.creds.read().expect("creds lock");
+        (creds.client_id.clone(), creds.auth_token.clone())
+    };
     let req = FailRequest {
         lease_id: lease_id.to_string(),
-        client_id: state.creds.read().expect("creds lock").client_id.clone(),
+        client_id,
+        auth_token,
         failure_type,
         details: Some(details.to_string()),
     };

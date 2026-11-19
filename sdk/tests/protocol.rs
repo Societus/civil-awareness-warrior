@@ -302,6 +302,58 @@ async fn lease_outliving_contract_fails_freshness() {
 // Heartbeat / result / fail / contract refresh
 // ---------------------------------------------------------------------------
 
+/// A minimal valid ingest result submission for `client_id`/`auth_token`.
+fn sample_submit(client_id: &str, auth_token: &str) -> ResultSubmit {
+    ResultSubmit {
+        chunk_id: "11111111-2222-4333-8444-555566667771".to_string(),
+        client_id: client_id.to_string(),
+        auth_token: auth_token.to_string(),
+        started_at: 1000,
+        completed_at: 2000,
+        manifest: lh_contributor_client::api::WorkerManifest {
+            chunk_type: ChunkType::Ingest,
+            target: "WI/55011".to_string(),
+            source_urls: vec!["https://gis.example.test/v2/parcels".to_string()],
+            page_count: 1,
+            page_sha256: vec![hex::encode(Sha256::digest(b"page"))],
+            reconciliation: None,
+            staged_features_blob: None,
+            raw_pages_blob_prefix: Some("stage/raw/ingest/WI/55011/l1/".to_string()),
+            extra: [("blob_encoding".to_string(), json!("zstd"))]
+                .into_iter()
+                .collect(),
+        },
+        evidence_blobs: vec!["stage/raw/ingest/WI/55011/l1/pages/0000.zst".to_string()],
+    }
+}
+
+/// Mount a stand-in for the tracker's warrior-auth gate (lh-tracker 6c024ad)
+/// on `route`: only the exact registered `client_id` + `auth_token` pair gets
+/// `success`; every other body — wrong OR missing token — gets the tracker's
+/// 401 `{"error":"unauthorized"}` (the check runs before lease binding). The
+/// last request body is captured into `seen` for wire assertions.
+fn token_gate_mock(
+    route: &'static str,
+    client_id: &'static str,
+    auth_token: &'static str,
+    success: ResponseTemplate,
+    seen: std::sync::Arc<std::sync::Mutex<Option<Value>>>,
+) -> Mock {
+    Mock::given(method("POST"))
+        .and(path(route))
+        .respond_with(move |req: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+            let authorized = body.get("client_id").and_then(Value::as_str) == Some(client_id)
+                && body.get("auth_token").and_then(Value::as_str) == Some(auth_token);
+            *seen.lock().unwrap() = Some(body);
+            if authorized {
+                success.clone()
+            } else {
+                ResponseTemplate::new(401).set_body_json(json!({ "error": "unauthorized" }))
+            }
+        })
+}
+
 #[tokio::test]
 async fn heartbeat_ok_and_expired() {
     let server = MockServer::start().await;
@@ -321,17 +373,70 @@ async fn heartbeat_ok_and_expired() {
         .await;
 
     let api = client(&server);
+    let creds = Credentials {
+        client_id: "c1".to_string(),
+        auth_token: "t1".to_string(),
+    };
     let hb = api
-        .heartbeat("c1", "live", Some("executing"))
+        .heartbeat(&creds, "live", Some("executing"))
         .await
         .unwrap();
     assert!(hb.ok);
     assert_eq!(hb.lease_expires_at, 1234567890123);
 
     assert!(matches!(
-        api.heartbeat("c1", "dead", None).await,
+        api.heartbeat(&creds, "dead", None).await,
         Err(ApiError::LeaseExpired)
     ));
+}
+
+/// Tracker contract (6c024ad): /v1/heartbeat verifies the warrior token
+/// before lease binding — correct token 200, wrong token 401. The SDK must
+/// put the exact Credentials token on the wire.
+#[tokio::test]
+async fn heartbeat_token_gate_correct_2xx_wrong_401() {
+    let server = MockServer::start().await;
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(None::<Value>));
+    token_gate_mock(
+        "/v1/heartbeat",
+        "c1",
+        "tok-correct",
+        ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "lease_expires_at": 42i64,
+        })),
+        seen.clone(),
+    )
+    .mount(&server)
+    .await;
+
+    let api = client(&server);
+    let good = Credentials {
+        client_id: "c1".to_string(),
+        auth_token: "tok-correct".to_string(),
+    };
+    let hb = api
+        .heartbeat(&good, "lease-live", Some("executing"))
+        .await
+        .unwrap();
+    assert!(hb.ok);
+
+    let body = seen.lock().unwrap().clone().expect("request captured");
+    assert_eq!(body["lease_id"], "lease-live");
+    assert_eq!(body["client_id"], "c1");
+    assert_eq!(body["auth_token"], "tok-correct");
+    assert_eq!(body["progress_note"], "executing");
+
+    let bad = Credentials {
+        client_id: "c1".to_string(),
+        auth_token: "not-the-token".to_string(),
+    };
+    assert!(matches!(
+        api.heartbeat(&bad, "lease-live", None).await,
+        Err(ApiError::Unauthorized)
+    ));
+    let body = seen.lock().unwrap().clone().expect("request captured");
+    assert_eq!(body["auth_token"], "not-the-token");
 }
 
 #[tokio::test]
@@ -354,26 +459,7 @@ async fn result_submission_201_and_conflict() {
         .await;
 
     let api = client(&server);
-    let submit = ResultSubmit {
-        chunk_id: "11111111-2222-4333-8444-555566667771".to_string(),
-        client_id: "c1".to_string(),
-        started_at: 1000,
-        completed_at: 2000,
-        manifest: lh_contributor_client::api::WorkerManifest {
-            chunk_type: ChunkType::Ingest,
-            target: "WI/55011".to_string(),
-            source_urls: vec!["https://gis.example.test/v2/parcels".to_string()],
-            page_count: 1,
-            page_sha256: vec![hex::encode(Sha256::digest(b"page"))],
-            reconciliation: None,
-            staged_features_blob: None,
-            raw_pages_blob_prefix: Some("stage/raw/ingest/WI/55011/l1/".to_string()),
-            extra: [("blob_encoding".to_string(), json!("zstd"))]
-                .into_iter()
-                .collect(),
-        },
-        evidence_blobs: vec!["stage/raw/ingest/WI/55011/l1/pages/0000.zst".to_string()],
-    };
+    let submit = sample_submit("c1", "t1");
 
     let receipt = api.submit_result(&submit).await.unwrap();
     assert_eq!(receipt.status, "staged");
@@ -381,6 +467,47 @@ async fn result_submission_201_and_conflict() {
         api.submit_result(&submit).await,
         Err(ApiError::Conflict(_))
     ));
+}
+
+/// Tracker contract (6c024ad): /v1/result verifies the warrior token before
+/// accepting a submission — correct token 201, wrong token 401 (no result
+/// staged).
+#[tokio::test]
+async fn result_token_gate_correct_201_wrong_401() {
+    let server = MockServer::start().await;
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(None::<Value>));
+    token_gate_mock(
+        "/v1/result",
+        "c1",
+        "tok-correct",
+        ResponseTemplate::new(201).set_body_json(json!({
+            "result_id": "res-1",
+            "status": "staged",
+        })),
+        seen.clone(),
+    )
+    .mount(&server)
+    .await;
+
+    let api = client(&server);
+    let receipt = api
+        .submit_result(&sample_submit("c1", "tok-correct"))
+        .await
+        .unwrap();
+    assert_eq!(receipt.status, "staged");
+
+    let body = seen.lock().unwrap().clone().expect("request captured");
+    assert_eq!(body["chunk_id"], "11111111-2222-4333-8444-555566667771");
+    assert_eq!(body["client_id"], "c1");
+    assert_eq!(body["auth_token"], "tok-correct");
+
+    assert!(matches!(
+        api.submit_result(&sample_submit("c1", "not-the-token"))
+            .await,
+        Err(ApiError::Unauthorized)
+    ));
+    let body = seen.lock().unwrap().clone().expect("request captured");
+    assert_eq!(body["auth_token"], "not-the-token");
 }
 
 #[tokio::test]
@@ -402,6 +529,7 @@ async fn fail_report_ok_and_lease_gone() {
     let req = FailRequest {
         lease_id: "lease-9".to_string(),
         client_id: "c1".to_string(),
+        auth_token: "t1".to_string(),
         failure_type: FailureType::Http5xx,
         details: Some("503 from county GIS".to_string()),
     };
@@ -410,6 +538,49 @@ async fn fail_report_ok_and_lease_gone() {
         api.report_fail(&req).await,
         Err(ApiError::NotFound(_))
     ));
+}
+
+/// Tracker contract (6c024ad): /v1/fail verifies the warrior token before
+/// mutating chunk state — correct token 200, wrong token 401.
+#[tokio::test]
+async fn fail_token_gate_correct_200_wrong_401() {
+    let server = MockServer::start().await;
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(None::<Value>));
+    token_gate_mock(
+        "/v1/fail",
+        "c1",
+        "tok-correct",
+        ResponseTemplate::new(200).set_body_json(json!({ "ok": true })),
+        seen.clone(),
+    )
+    .mount(&server)
+    .await;
+
+    let api = client(&server);
+    let req = FailRequest {
+        lease_id: "lease-9".to_string(),
+        client_id: "c1".to_string(),
+        auth_token: "tok-correct".to_string(),
+        failure_type: FailureType::Http5xx,
+        details: Some("503 from county GIS".to_string()),
+    };
+    api.report_fail(&req).await.unwrap();
+
+    let body = seen.lock().unwrap().clone().expect("request captured");
+    assert_eq!(body["lease_id"], "lease-9");
+    assert_eq!(body["client_id"], "c1");
+    assert_eq!(body["auth_token"], "tok-correct");
+
+    let bad = FailRequest {
+        auth_token: "not-the-token".to_string(),
+        ..req
+    };
+    assert!(matches!(
+        api.report_fail(&bad).await,
+        Err(ApiError::Unauthorized)
+    ));
+    let body = seen.lock().unwrap().clone().expect("request captured");
+    assert_eq!(body["auth_token"], "not-the-token");
 }
 
 #[tokio::test]

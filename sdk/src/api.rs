@@ -2,8 +2,9 @@
 //!
 //! Wire shapes mirror `lh-tracker/src/types.ts` and `src/lib/schema.ts`
 //! (snake_case JSON, zod constraints). Auth is body-carried, not headers:
-//! `/v1/lease` takes `client_id` + `auth_token`; `/v1/heartbeat`, `/v1/result`
-//! and `/v1/fail` take `client_id` and/or `lease_id`.
+//! every authenticated route (`/v1/lease`, `/v1/heartbeat`, `/v1/result`,
+//! `/v1/fail`) takes `client_id` + `auth_token` and 401s when the token is
+//! wrong OR missing, so the SDK always sends it.
 
 use crate::error::ApiError;
 use serde::{Deserialize, Serialize};
@@ -362,6 +363,11 @@ pub struct Credentials {
 pub struct HeartbeatRequest {
     pub lease_id: String,
     pub client_id: String,
+    /// Warrior auth token from the register response. The tracker marks it
+    /// optional on the wire ONLY so absence can 401 instead of 400 — it
+    /// verifies sha256(token) against `clients.auth_token_hash` (constant
+    /// time) BEFORE lease binding, so this field is required here.
+    pub auth_token: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub progress_note: Option<String>,
 }
@@ -420,6 +426,8 @@ impl std::fmt::Display for FailureType {
 pub struct FailRequest {
     pub lease_id: String,
     pub client_id: String,
+    /// Warrior auth token — always sent; see [`HeartbeatRequest::auth_token`].
+    pub auth_token: String,
     pub failure_type: FailureType,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<String>,
@@ -453,6 +461,8 @@ pub struct WorkerManifest {
 pub struct ResultSubmit {
     pub chunk_id: String,
     pub client_id: String,
+    /// Warrior auth token — always sent; see [`HeartbeatRequest::auth_token`].
+    pub auth_token: String,
     /// Unix ms.
     pub started_at: i64,
     /// Unix ms.
@@ -671,15 +681,16 @@ impl ApiClient {
 
     pub async fn heartbeat(
         &self,
-        client_id: &str,
+        creds: &Credentials,
         lease_id: &str,
         progress_note: Option<&str>,
     ) -> Result<HeartbeatResponse, ApiError> {
-        let body = serde_json::json!({
-            "lease_id": lease_id,
-            "client_id": client_id,
-            "progress_note": progress_note,
-        });
+        let body = HeartbeatRequest {
+            lease_id: lease_id.to_string(),
+            client_id: creds.client_id.clone(),
+            auth_token: creds.auth_token.clone(),
+            progress_note: progress_note.map(str::to_string),
+        };
         self.post("/v1/heartbeat", &body).await
     }
 
