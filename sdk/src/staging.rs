@@ -52,12 +52,18 @@ pub struct StoredBlob {
 }
 
 /// Compress + upload one blob under `{prefix}{name}.zst`.
+///
+/// The lease `staging_upload_prefix` is validated against the strict
+/// grammar ([`validate_blob_key`]) before it is folded into the blob key,
+/// so no stager (R2, presign, or local) ever stages under an invalid
+/// prefix.
 pub async fn put_zstd(
     stager: &dyn BlobStager,
     prefix: &str,
     name: &str,
     raw: &[u8],
 ) -> Result<StoredBlob, StageError> {
+    validate_blob_key(prefix)?;
     let compressed = zstd::bulk::compress(raw, 3)
         .map_err(|e| StageError::BadKey(format!("zstd compression failed: {e}")))?;
     let key = format!("{prefix}{name}.zst");
@@ -555,16 +561,67 @@ pub fn build_stager(
     }
 }
 
-/// Reject keys that could escape the staging prefix (path traversal).
-pub fn validate_blob_key(prefix: &str, key: &str) -> Result<(), StageError> {
-    if !key.starts_with(prefix) {
+/// Maximum length of a lease `staging_upload_prefix`.
+pub const MAX_PREFIX_LEN: usize = 128;
+
+/// Strict grammar for a lease `staging_upload_prefix`, validated before the
+/// prefix is ever used to build a blob key (R2, presign, or local stager).
+///
+/// Accepted: lowercase alphanumerics, hyphens, and forward slashes only.
+/// Rejected: backslash, drive letters/colons (excluded by the charset),
+/// empty segments, dot segments (`.` / `..`), and any prefix over
+/// [`MAX_PREFIX_LEN`] bytes. A single trailing slash (directory convention)
+/// is tolerated.
+///
+/// Returns [`StageError::BadKey`] on any violation. Callers treat rejection
+/// as fail-closed: never stage under an invalid prefix.
+pub fn validate_blob_key(prefix: &str) -> Result<(), StageError> {
+    if prefix.is_empty() {
+        tracing::warn!("staging prefix is empty; rejecting lease");
+        return Err(StageError::BadKey("staging prefix is empty".to_string()));
+    }
+    if prefix.len() > MAX_PREFIX_LEN {
+        tracing::warn!(
+            "staging prefix too long ({} > {MAX_PREFIX_LEN}): {prefix}",
+            prefix.len()
+        );
         return Err(StageError::BadKey(format!(
-            "blob key {key:?} is not under lease prefix {prefix:?}"
+            "staging prefix too long ({} > {MAX_PREFIX_LEN}): {prefix}",
+            prefix.len()
         )));
+    }
+    for b in prefix.bytes() {
+        if !(b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'/') {
+            tracing::warn!(
+                "staging prefix has invalid byte {b:?}: {prefix}; rejecting lease"
+            );
+            return Err(StageError::BadKey(format!(
+                "staging prefix has invalid byte {b:?}: {prefix}"
+            )));
+        }
+    }
+    // A trailing slash is the directory convention; strip it so segment
+    // checks below don't see a spurious empty trailing segment.
+    let body = prefix.strip_suffix('/').unwrap_or(prefix);
+    if body.is_empty() {
+        tracing::warn!("staging prefix is empty; rejecting lease");
+        return Err(StageError::BadKey("staging prefix is empty".to_string()));
+    }
+    for seg in body.split('/') {
+        if seg.is_empty() || seg == "." || seg == ".." {
+            tracing::warn!(
+                "staging prefix has empty or dot segment: {prefix}; rejecting lease"
+            );
+            return Err(StageError::BadKey(format!(
+                "staging prefix has empty or dot segment: {prefix}"
+            )));
+        }
     }
     Ok(())
 }
 
+/// Unused path helper kept deliberately for callers that probe the local
+/// filesystem directly (not part of the prefix-validation path).
 #[allow(dead_code)]
 fn unused_path_helper(p: &Path) -> bool {
     p.exists()
@@ -654,15 +711,74 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("lh-zstd-test-{}", std::process::id()));
         let stager = LocalStager::new(&dir);
         let raw = b"setback interior: 25 ft; abutting street: 30 ft".repeat(50);
-        let blob = put_zstd(&stager, "stage/raw/ingest/X/1/l1/", "pages/0000", &raw)
+        let blob = put_zstd(&stager, "stage/raw/ingest/x/1/l1/", "pages/0000", &raw)
             .await
             .unwrap();
-        assert_eq!(blob.key, "stage/raw/ingest/X/1/l1/pages/0000.zst");
+        assert_eq!(blob.key, "stage/raw/ingest/x/1/l1/pages/0000.zst");
         assert_eq!(blob.raw_sha256, hex::encode(Sha256::digest(&raw)));
         let stored = stager.get_object(&blob.key).await.unwrap();
         assert_eq!(hex::encode(Sha256::digest(&stored)), blob.stored_sha256);
         let decompressed = zstd::bulk::decompress(&stored, raw.len() * 2).unwrap();
         assert_eq!(decompressed, raw);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn validate_blob_key_accepts_valid_prefixes() {
+        for prefix in [
+            "stage/raw/ingest/wi/55011/lease-1/",
+            "stage/raw/ingest/wi/55011/lease-1",
+            "a",
+            "a-b",
+            "a/b/c",
+            "0/9/zz",
+        ] {
+            assert!(
+                validate_blob_key(prefix).is_ok(),
+                "prefix {prefix:?} should be valid"
+            );
+        }
+        // Exactly 128 bytes is at the cap and accepted.
+        assert!(validate_blob_key(&"a".repeat(128)).is_ok());
+    }
+
+    #[test]
+    fn validate_blob_key_rejects_invalid_prefixes() {
+        let invalid = [
+            "stage\\\\raw\\\\ingest",   // backslash (Windows traversal)
+            "C:\\\\staging",           // drive-absolute Windows path
+            "c:/mix",                  // colon
+            "stage/../escape",         // .. segment
+            "stage/./raw",             // . segment
+            "stage/raw/..",            // trailing ..
+            "stage//raw",              // empty segment
+            "/stage/raw",              // leading empty segment
+            "Stage/raw",               // uppercase
+            "stage/RAW",               // uppercase
+        ];
+        for prefix in invalid {
+            assert!(
+                validate_blob_key(prefix).is_err(),
+                "prefix {prefix:?} should be invalid"
+            );
+        }
+        // Oversized (> 128 bytes).
+        assert!(validate_blob_key(&"a".repeat(129)).is_err());
+    }
+
+    #[tokio::test]
+    async fn put_zstd_rejects_invalid_prefix() {
+        let dir = std::env::temp_dir().join(format!(
+            "lh-zstd-bad-{}",
+            std::process::id()
+        ));
+        let stager = LocalStager::new(&dir);
+        let err = put_zstd(&stager, "stage\\\\bad\\\\prefix", "x.zst", b"hi")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StageError::BadKey(_)));
+        // Nothing was staged under the bad prefix.
+        assert!(!dir.exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

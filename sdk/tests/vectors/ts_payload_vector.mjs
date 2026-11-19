@@ -54,6 +54,7 @@ const contract = {
     nothing: null,
   },
   schema_version: 1,
+  staging_upload_prefix: 'stage/raw/examination/wi/55011/lease-1/',
   expires_at: 1799999999999,
 };
 

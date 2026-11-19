@@ -27,13 +27,19 @@ fn pubkey_hex() -> String {
 
 /// Build a signed contract Value exactly as stored in chunks.contract_json
 /// (flattened envelope fields + embedded signature).
-fn signed_contract_value(chunk_id: &str, chunk_type: &str, lease_expires_ms: i64) -> Value {
+fn signed_contract_value(
+    chunk_id: &str,
+    chunk_type: &str,
+    staging_upload_prefix: &str,
+    lease_expires_ms: i64,
+) -> Value {
     let now = lh_contributor_client::api::unix_ms();
     let contract_expires = now + 2 * 3600 * 1000;
     let mut contract = json!({
         "type": chunk_type,
         "target_key": "WI/55011",
         "schema_version": 1,
+        "staging_upload_prefix": staging_upload_prefix,
         "expires_at": contract_expires,
         "payload": {
             "fetch_plan": {
@@ -47,6 +53,7 @@ fn signed_contract_value(chunk_id: &str, chunk_type: &str, lease_expires_ms: i64
         },
     });
     // Sign the core (contract minus envelope fields) over the canonical form.
+    // `staging_upload_prefix` is part of the core and is covered by the signature.
     let core: Value = {
         let mut v = contract.clone();
         v.as_object_mut().unwrap().remove("expires_at");
@@ -68,14 +75,17 @@ fn signed_contract_value(chunk_id: &str, chunk_type: &str, lease_expires_ms: i64
 fn lease_response_json(chunk_type: &str, slot_note: &str) -> Value {
     let now = lh_contributor_client::api::unix_ms();
     let chunk_id = format!("11111111-2222-4333-8444-55556666777{slot_note}");
-    let contract = signed_contract_value(&chunk_id, chunk_type, now + 3600 * 1000);
+    // The lease envelope prefix must match the signed contract prefix
+    // (lowercase-only grammar enforced by verify_lease_contract).
+    let prefix = format!("stage/raw/{chunk_type}/wi/55011/lease-{slot_note}/");
+    let contract = signed_contract_value(&chunk_id, chunk_type, &prefix, now + 3600 * 1000);
     json!({
-        "lease_id": format!("lease-{}", slot_note),
+        "lease_id": format!("lease-{slot_note}"),
         "chunk_id": chunk_id,
         "contract": contract,
         "expires_at": now + 3600 * 1000,
         "heartbeat_interval_sec": 60,
-        "staging_upload_prefix": format!("stage/raw/{chunk_type}/WI/55011/lease-{}/", slot_note),
+        "staging_upload_prefix": prefix,
         "rate_budget": {"requests_per_min": 120, "bytes_per_min": 5_000_000},
     })
 }
@@ -406,7 +416,7 @@ async fn fail_report_ok_and_lease_gone() {
 async fn contract_refresh_serves_verifiable_contract() {
     let server = MockServer::start().await;
     let chunk_id = "11111111-2222-4333-8444-555566667774";
-    let contract = signed_contract_value(chunk_id, "ingest", 0);
+    let contract = signed_contract_value(chunk_id, "ingest", "stage/raw/ingest/wi/55011/lease-4/", 0);
     Mock::given(method("GET"))
         .and(path(format!("/v1/chunk/{chunk_id}/contract")))
         .respond_with(ResponseTemplate::new(200).set_body_json(contract))

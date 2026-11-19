@@ -78,6 +78,14 @@ pub struct SignedChunkContract {
     pub expires_at: i64,
     /// ed25519 signature (hex) over `{chunk_id}:{canonical core json}:{expires_at}`.
     pub operator_signature_hex: String,
+    /// Lease `staging_upload_prefix`, folded into the signed contract core so
+    /// the operator signature covers it. Clients must reject a lease whose
+    /// `staging_upload_prefix` (used to build blob keys) does not match the
+    /// signed contract value. `#[serde(default)]` keeps old, pre-prefix
+    /// contracts deserializable; their signature then fails verification
+    /// (fail-closed, clean break).
+    #[serde(default)]
+    pub staging_upload_prefix: String,
 }
 
 // ---------------------------------------------------------------------------

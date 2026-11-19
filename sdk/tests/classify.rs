@@ -46,6 +46,7 @@ fn classify_contract_value(input: Value) -> Value {
         "type": "classify",
         "target_key": "WI/55011",
         "schema_version": 1,
+        "staging_upload_prefix": "stage/raw/classify/wi/55011/lease-1/",
         "expires_at": lh_contributor_client::api::unix_ms() + 3600 * 1000,
         "payload": {
             "prompt_template_id": "search_result_relevance_v1",
@@ -127,7 +128,7 @@ impl Harness {
                 lease_id: "lease-1".to_string(),
                 chunk_id: CHUNK_ID.to_string(),
                 target_key: "WI/55011".to_string(),
-                staging_upload_prefix: "stage/raw/classify/WI/55011/lease-1/".to_string(),
+                staging_upload_prefix: "stage/raw/classify/wi/55011/lease-1/".to_string(),
             },
             user_agent: "lh-contributor/test".to_string(),
             brave_api_key: None,
@@ -555,6 +556,7 @@ fn classify_contract_payload_matches_typescript() {
         },
         expires_at: 1_799_999_999_999,
         operator_signature_hex: String::new(),
+        staging_upload_prefix: "stage/raw/classify/wi/55011/lease-1/".to_string(),
     };
     let chunk_id = "c1a551f7-0000-4000-8000-00000000000f";
     let payload = lh_contributor_client::crypto::build_contract_payload(chunk_id, &contract);
@@ -565,19 +567,19 @@ fn classify_contract_payload_matches_typescript() {
         payload_str,
         concat!(
             "c1a551f7-0000-4000-8000-00000000000f:",
-            "{\"payload\":{\"expected_verdicts\":3,\"input\":{\"kind\":\"search_result_set\",\"query_plan\":{\"backend\":\"brave\",\"queries\":[{\"max_results\":5,\"query\":\"wi 55011 gis parcels\"}]}},\"prompt_template_id\":\"search_result_relevance_v1\",\"rubric\":{\"irrelevant_criteria\":[\"third-party aggregators\",\"paywalled news articles\"],\"objective\":\"Find official county GIS or election-data portals\",\"relevant_criteria\":[\"official .gov or .us domain\",\"serves parcel/zoning/election data\"]},\"verdict_schema\":\"classify_verdict_v1\"},\"schema_version\":1,\"target_key\":\"WI/55011\",\"type\":\"classify\"}:",
+            "{\"payload\":{\"expected_verdicts\":3,\"input\":{\"kind\":\"search_result_set\",\"query_plan\":{\"backend\":\"brave\",\"queries\":[{\"max_results\":5,\"query\":\"wi 55011 gis parcels\"}]}},\"prompt_template_id\":\"search_result_relevance_v1\",\"rubric\":{\"irrelevant_criteria\":[\"third-party aggregators\",\"paywalled news articles\"],\"objective\":\"Find official county GIS or election-data portals\",\"relevant_criteria\":[\"official .gov or .us domain\",\"serves parcel/zoning/election data\"]},\"verdict_schema\":\"classify_verdict_v1\"},\"schema_version\":1,\"staging_upload_prefix\":\"stage/raw/classify/wi/55011/lease-1/\",\"target_key\":\"WI/55011\",\"type\":\"classify\"}:",
             "1799999999999",
         )
     );
     assert_eq!(
         hex::encode(Sha256::digest(&payload)),
-        "2adda730040c60aa7d186117da099510ab5ea4460b6cc4290dd272172a1578e7"
+        "8d570642bfccf718a638deefc9cc150a56f9fc4f72de705bd6c0c0f0832d2b48"
     );
 
     // Full chain: node ed25519 signature over those exact bytes verifies
     // under dalek (values from tests/vectors/classify_vector.mjs).
     let pubkey_hex = "3e7127b77afa2f7241ad41278af4d6f8df235710b379c2e03798bc522b150835";
-    let sig_hex = "86236ff871c1214f7183d79169861d93bdbde86e6fcaeb0747e14238daf335304d8ab46688a9b1cfd80b5bc57963b7dbd27f60333fffc5566e6ffa8e134c8700";
+    let sig_hex = "0269089cf00531eb0c32b13cc68352f8c3a74471ca37f8cb6cf67be0f0fbd8b88c5dd12983ba0a536d7e638bd53e5abe1a4f758201e4de401597128b8f85c70a";
     let vk = lh_contributor_client::crypto::parse_public_key_hex(pubkey_hex).unwrap();
     let sig = Signature::from_bytes(&hex::decode(sig_hex).unwrap().try_into().unwrap());
     assert!(

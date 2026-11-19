@@ -41,6 +41,7 @@ const contract = {
   type: 'classify',
   target_key: 'WI/55011',
   schema_version: 1,
+  staging_upload_prefix: 'stage/raw/classify/wi/55011/lease-1/',
   payload: {
     prompt_template_id: 'search_result_relevance_v1',
     rubric: {

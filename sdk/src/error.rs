@@ -74,6 +74,9 @@ pub enum LeaseVerifyError {
     #[error("operator signature does not verify against the configured public key")]
     BadSignature,
 
+    #[error("lease staging_upload_prefix is invalid: {0}")]
+    InvalidPrefix(String),
+
     #[error("configured public key is malformed: {0}")]
     BadPublicKey(String),
 }

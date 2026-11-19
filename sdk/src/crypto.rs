@@ -9,7 +9,8 @@
 //!
 //! - `canonical_core_json`: the contract minus `expires_at` and
 //!   `operator_signature_hex`, serialized with recursively sorted object keys
-//!   and no whitespace.
+//!   and no whitespace. This includes `staging_upload_prefix`, so the
+//!   operator signature covers the lease's staging prefix.
 //! - `expires_at`: unix **milliseconds**, decimal.
 //! - The UTF-8 bytes of that string are what the operator signed; we verify.
 //!
@@ -27,6 +28,7 @@
 
 use crate::api::{LeaseResponse, SignedChunkContract};
 use crate::error::LeaseVerifyError;
+use crate::staging::validate_blob_key;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde_json::Value;
 
@@ -127,6 +129,8 @@ fn write_json_string(s: &str, out: &mut String) {
 }
 
 /// Core of the contract = everything except the two envelope fields.
+/// `staging_upload_prefix` is part of the core and is therefore covered by
+/// the operator signature.
 fn contract_core(contract: &SignedChunkContract) -> Value {
     let mut value = serde_json::to_value(contract).expect("contract serializes");
     if let Value::Object(map) = &mut value {
@@ -177,6 +181,10 @@ pub fn verify_lease_contract(
     if contract.expires_at <= 0 || contract.operator_signature_hex.is_empty() {
         return Err(LeaseVerifyError::Unsigned);
     }
+    // Fail-closed: the lease envelope prefix (used to build blob keys) must
+    // pass the strict staging-key grammar before anything else touches it.
+    validate_blob_key(&lease.staging_upload_prefix)
+        .map_err(|e| LeaseVerifyError::InvalidPrefix(e.to_string()))?;
     if now_ms >= lease.expires_at {
         return Err(LeaseVerifyError::LeaseStale);
     }
@@ -187,6 +195,17 @@ pub fn verify_lease_contract(
         return Err(LeaseVerifyError::ContractExpired);
     }
     if !verify_contract(public_key_hex, &lease.chunk_id, contract) {
+        return Err(LeaseVerifyError::BadSignature);
+    }
+    // Fail-closed: the prefix the client stages under (lease envelope) must
+    // equal the prefix covered by the operator signature (contract). A lease
+    // whose signature does not cover the prefix it actually uses is rejected.
+    if lease.staging_upload_prefix != contract.staging_upload_prefix {
+        tracing::warn!(
+            "lease staging_upload_prefix {:?} does not match signed contract prefix {:?}; rejecting lease",
+            lease.staging_upload_prefix,
+            contract.staging_upload_prefix,
+        );
         return Err(LeaseVerifyError::BadSignature);
     }
     Ok(())
@@ -227,6 +246,7 @@ mod tests {
             },
             expires_at,
             operator_signature_hex: String::new(),
+            staging_upload_prefix: "stage/raw/examination/wi/55011/lease-1/".to_string(),
         }
     }
 
@@ -274,6 +294,11 @@ mod tests {
         tampered.core.payload["count"] = serde_json::json!(1201);
         assert!(!verify_contract(&pub_hex, chunk_id, &tampered));
 
+        // Tamper with the signed prefix -> must fail.
+        let mut bad_prefix = signed.clone();
+        bad_prefix.staging_upload_prefix = "stage/tampered/WI/55011/lease-1/".to_string();
+        assert!(!verify_contract(&pub_hex, chunk_id, &bad_prefix));
+
         // Wrong chunk_id -> must fail.
         assert!(!verify_contract(&pub_hex, "other-chunk", &signed));
 
@@ -295,7 +320,7 @@ mod tests {
         let payload_str = String::from_utf8(payload.clone()).unwrap();
         let expected = concat!(
             "0f0e6d3a-1111-4222-8333-444455556666:",
-            r#"{"payload":{"count":1200,"expected_measurements":[{"expected_type":"number","name":"page_count","tolerance":0.5},{"expected_type":"boolean","name":"has_setbacks"}],"flag":true,"nothing":null,"parser_id":"municode_extract_v1","ratio":2.5,"staged_blob_key":"stage/ops/examination/WI/55011/blob.zst","unicode":"Königsberger Straße \u0007"},"schema_version":1,"target_key":"WI/55011","type":"examination"}:"#,
+            r#"{"payload":{"count":1200,"expected_measurements":[{"expected_type":"number","name":"page_count","tolerance":0.5},{"expected_type":"boolean","name":"has_setbacks"}],"flag":true,"nothing":null,"parser_id":"municode_extract_v1","ratio":2.5,"staged_blob_key":"stage/ops/examination/WI/55011/blob.zst","unicode":"Königsberger Straße \u0007"},"schema_version":1,"staging_upload_prefix":"stage/raw/examination/wi/55011/lease-1/","target_key":"WI/55011","type":"examination"}:"#,
             "1799999999999",
         );
         assert_eq!(payload_str, expected);
@@ -304,7 +329,7 @@ mod tests {
         use sha2::{Digest, Sha256};
         assert_eq!(
             hex::encode(Sha256::digest(&payload)),
-            "93db718df48ec3ee59df87a3b2e9278c33f4b3635c181eab450d9f071df0abfd"
+            "1a89be82759024c001adbbd56d0d74570436c35ef29b6b2c6d78e1134eab252a"
         );
     }
 
@@ -317,15 +342,15 @@ mod tests {
         // Deterministic key would be nicer, but this pins the real
         // interop: pubkey + signature generated by node:crypto in the
         // vector script run, payload rebuilt on the Rust side.
-        let pubkey_hex = "8976efbb9c452a4b160d0a318dd2250219bd970b688c8e579154b3e0fb5f0b36";
-        let sig_hex = "11028a08b552c0f4d092ff08ea3e08e154f9bbaea1bb23c27ca66f551d30256812d6c5d65fbff2f5fdd87babb1f11d1c7ec41933a2c69aeccb8b446311463906";
+        let pubkey_hex = "a0b333abf70fc8c0acc7cb5d79a089b6eebe861cc8fca48d1def781f21e707de";
+        let sig_hex = "da7ae141ada61dc66a3c7eef894dbe8ac0fd06ce269a013df98c6c626ad80c15360c9866567f00fd58781774941a7ac77bb9c669d9132e29b4c077bfe393b60e";
         let contract = fixture_contract(1_799_999_999_999);
         let chunk_id = "0f0e6d3a-1111-4222-8333-444455556666";
         let payload = build_contract_payload(chunk_id, &contract);
         // Guard: the payload this signature covers must be OUR payload.
         assert_eq!(
             hex::encode(Sha256::digest(&payload)),
-            "93db718df48ec3ee59df87a3b2e9278c33f4b3635c181eab450d9f071df0abfd"
+            "1a89be82759024c001adbbd56d0d74570436c35ef29b6b2c6d78e1134eab252a"
         );
         let vk = parse_public_key_hex(pubkey_hex).expect("pubkey");
         let sig_bytes = hex::decode(sig_hex).expect("sig hex");

@@ -45,7 +45,7 @@ fn exec_ctx(_server: &MockServer, staging_root: &std::path::Path) -> ExecContext
             lease_id: "lease-1".to_string(),
             chunk_id: "chunk-1".to_string(),
             target_key: "WI/55011".to_string(),
-            staging_upload_prefix: "stage/raw/test/WI/55011/lease-1/".to_string(),
+            staging_upload_prefix: "stage/raw/test/wi/55011/lease-1/".to_string(),
         },
         user_agent: "lh-contributor/test".to_string(),
         brave_api_key: None,
@@ -131,7 +131,7 @@ async fn ingest_fetches_pages_hashes_and_stages() {
     );
     assert_eq!(
         m.raw_pages_blob_prefix.as_deref(),
-        Some("stage/raw/test/WI/55011/lease-1/")
+        Some("stage/raw/test/wi/55011/lease-1/")
     );
     assert_eq!(m.extra["blob_encoding"], json!("zstd"));
     // Reconciliation evaluated + passed.
@@ -146,7 +146,7 @@ async fn ingest_fetches_pages_hashes_and_stages() {
 
     // Blobs actually staged as zstd under the lease prefix.
     for (i, key) in outcome.evidence_blobs.iter().enumerate() {
-        let expected = format!("stage/raw/test/WI/55011/lease-1/pages/{i:04}.zst");
+        let expected = format!("stage/raw/test/wi/55011/lease-1/pages/{i:04}.zst");
         assert_eq!(key, &expected);
         let raw = match i {
             0 => page1_body.as_bytes(),
@@ -387,9 +387,9 @@ async fn state_walk_fetches_roster_and_stages_features() {
     assert_eq!(outcome.manifest.page_count, 1);
     assert_eq!(
         outcome.manifest.staged_features_blob.as_deref(),
-        Some("stage/raw/test/WI/55011/lease-1/features.zst")
+        Some("stage/raw/test/wi/55011/lease-1/features.zst")
     );
-    let blob_path = staging_root.join("stage/raw/test/WI/55011/lease-1/features.zst");
+    let blob_path = staging_root.join("stage/raw/test/wi/55011/lease-1/features.zst");
     assert!(blob_path.exists(), "features blob must be staged");
     let _ = std::fs::remove_dir_all(staging_root);
 }
