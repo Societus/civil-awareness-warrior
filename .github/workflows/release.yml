@@ -50,7 +50,7 @@ jobs:
           # arm64 + x86_64 in one universal binary (arm64 runner cross-
           # builds the x86_64 slice; the dmg carries the universal .app).
           - name: macos-universal
-            os: macos-14
+            os: macos-15
             bundles: dmg
             tauri_extra: --target universal-apple-darwin
             rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
