@@ -351,7 +351,7 @@
 	});
 
 	/** download / check / free-disk backend commands (real app only). */
-	async function lmAction(/** @type {string} */ cmd, /** @type {string} */ label) {
+	async function lmAction(/** @type {string} */ cmd, /** @type {string} */ label, /** @type {Record<string, unknown> | undefined} */ args = undefined) {
 		if (!inTauri) {
 			note = `${label} is only available in the real app — the browser demo mirrors the UI shape only.`;
 			return;
@@ -360,7 +360,7 @@
 		note = '';
 		errors = {};
 		try {
-			note = String(await invoke(cmd));
+			note = String(await invoke(cmd, args ?? {}));
 			await onChanged?.();
 		} catch (e) {
 			errors = toFieldErrors(e);
@@ -756,7 +756,7 @@
 					{#if llm?.detail}
 						<p class="fine lm-detail">{llm.detail}</p>
 					{/if}
-					<button onclick={() => lmAction('check_local_model', 'Endpoint check')} disabled={busy}>Check now</button>
+					<button onclick={() => lmAction('check_local_model', 'Endpoint check', { endpoint: draft.local_model.endpoint, model: draft.local_model.model_name })} disabled={busy}>Check now</button>
 				{/if}
 
 				<div>

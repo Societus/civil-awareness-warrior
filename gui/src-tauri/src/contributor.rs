@@ -1986,11 +1986,46 @@ pub fn delete_local_model(app: AppHandle) -> Result<String, String> {
 /// Running the safety monitor reaps it within ~10s (a sidecar lives only
 /// while the loop runs). Errors are human sentences.
 #[tauri::command]
-pub async fn check_local_model(app: AppHandle) -> Result<String, String> {
+pub async fn check_local_model(
+    app: AppHandle,
+    endpoint: Option<String>,
+    model: Option<String>,
+) -> Result<String, String> {
     let st = app.state::<Arc<AppState>>();
     let mode = st.settings_snapshot().local_model.mode;
     if mode == LlmMode::None {
         return Ok("the Local Model is off — nothing to check".to_string());
+    }
+    // Draft probe: a Custom-mode endpoint typed but not yet saved is invisible
+    // to the saved-snapshot path below ("not probed since the last save").
+    // Validate exactly like GuiSettings::validate() — a probe must never be a
+    // looser path than a save — and probe WITHOUT touching lane state:
+    // nothing here persists, stores, or logs the draft values.
+    if let Some(ep) = endpoint.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if mode != LlmMode::Custom {
+            return Err(
+                "an endpoint override only applies to Custom endpoint mode".to_string(),
+            );
+        }
+        if !ep.starts_with("http://") && !ep.starts_with("https://") {
+            return Err("endpoint must start with http:// or https://".to_string());
+        }
+        url::Url::parse(ep).map_err(|_| "endpoint is not a valid URL".to_string())?;
+        let base = crate::sidecar::ensure_v1(ep);
+        let shown = model
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|m| format!(" (model {m})"))
+            .unwrap_or_default();
+        return match crate::sidecar::probe_endpoint(&base).await {
+            Ok(()) => Ok(format!(
+                "{base} is answering — press Save to keep it; Start/Register will then advertise the search-grading capability{shown}"
+            )),
+            Err(e) => Err(format!(
+                "the custom endpoint {base} did not answer (GET /health, then /v1/models): {e}"
+            )),
+        };
     }
     let budget = if mode == LlmMode::Auto {
         Duration::from_secs(SIDECAR_MONITOR_HEALTH_SECS)
