@@ -54,6 +54,8 @@ jobs:
             bundles: dmg
             tauri_extra: --target universal-apple-darwin
             rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
+            # with an explicit --target, tauri puts bundles under target/<triple>/release/bundle
+            bundle_dir: universal-apple-darwin/release
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout this repo
@@ -103,7 +105,7 @@ jobs:
       # display name inside the .app / Start-menu entry is unaffected.)
       - name: Normalize bundle artifact names (display name → kebab)
         if: runner.os != 'Windows'
-        working-directory: gui/src-tauri/target/release/bundle
+        working-directory: gui/src-tauri/target/${{ matrix.bundle_dir || 'release' }}/bundle
         shell: bash
         run: |
           shopt -s nullglob
@@ -146,7 +148,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: bundles-${{ matrix.name }}
-          path: gui/src-tauri/target/release/bundle/**
+          path: gui/src-tauri/target/${{ matrix.bundle_dir || 'release' }}/bundle/**
           if-no-files-found: error
           retention-days: 14
 
