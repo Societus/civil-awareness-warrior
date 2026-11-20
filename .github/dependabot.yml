@@ -1,5 +1,11 @@
 version: 2
 updates:
+  # Keep SHA-pinned GitHub Actions fresh (every `uses:` in release.yml is
+  # SHA-pinned — dependabot bumps the pin and updates the version comment).
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
   # glib is a transitive dependency of Tauri's Linux GTK stack — the version is
   # pinned by the Tauri crate, not by us. RUSTSEC-2024-0429 was triaged not-used
   # (static audit 2026-11-18, Dependabot alert #2 dismissed). Bumping glib
