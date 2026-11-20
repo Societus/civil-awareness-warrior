@@ -26,7 +26,7 @@ tokio = { version = "1", features = ["sync", "time"] }
 # this tree via reqwest + the client lib; libc via tauri's deps. Direct deps
 # so the sidecar code can import them (same zero-cost precedent as chrono).
 url = "2"
-sha2 = "0.10"
+sha2 = "0.11"
 futures-util = "0.3"
 libc = "0.2"
 # "Can I AI?" advisor links (t_10daf382): the hardware report carries the
