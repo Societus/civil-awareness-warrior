@@ -315,7 +315,7 @@ pub fn parse_nvidia_mib_csv(csv: &str) -> Option<u64> {
 
 #[cfg(target_os = "macos")]
 fn macos_facts() -> ProbeFacts {
-    let ram = sysctl_read("hw.memsize").and_then(parse_sysctl_u64);
+    let ram = sysctl_read("hw.memsize").as_deref().and_then(parse_sysctl_u64);
     let arm64 = sysctl_read("hw.optional.arm64")
         .map(|v| v.trim() == "1")
         .unwrap_or(false);
