@@ -1,4 +1,5 @@
-# Release pipeline for the LandHunter contributor GUI (card t_f9279e25).
+# Release pipeline for the Civil Awareness Warrior GUI (card t_f9279e25;
+# rebrand t_417bde85).
 #
 # Trigger: a tag push matching v* (or a manual dispatch — see README
 # "Releasing" for what each does). One build per OS on GitHub-hosted
@@ -92,6 +93,40 @@ jobs:
         working-directory: gui
         run: npx tauri build ${{ matrix.tauri_extra }} --bundles ${{ matrix.bundles }}
 
+      # The bundler names bundle artifacts after the DISPLAY productName
+      # (spaces included) and Tauri 2 has no separate installer-name config
+      # (upstream tauri#13999); a GitHub Release upload would then mangle
+      # every space to a dot ("Civil.Awareness.Warrior_…"). Rename the
+      # display-name prefix to the kebab name so every release asset is
+      # civil-awareness-warrior_*. (The executables inside installers keep
+      # their civil-awareness-warrior name via bundle.mainBinaryName; the
+      # display name inside the .app / Start-menu entry is unaffected.)
+      - name: Normalize bundle artifact names (display name → kebab)
+        if: runner.os != 'Windows'
+        working-directory: gui/src-tauri/target/release/bundle
+        shell: bash
+        run: |
+          shopt -s nullglob
+          for f in */*; do
+            # Files only (deb/AppImage/dmg/rpm): bundle/macos/*.app is a
+            # DIRECTORY that must keep its display name — the dmg embeds it.
+            [ -f "$f" ] || continue
+            d=$(dirname "$f"); b=$(basename "$f")
+            case "$b" in
+              "Civil Awareness Warrior"*)
+                mv "$f" "$d/civil-awareness-warrior${b#Civil Awareness Warrior}" ;;
+            esac
+          done
+
+      - name: Normalize bundle artifact names (Windows)
+        if: runner.os == 'Windows'
+        working-directory: gui/src-tauri/target/release/bundle
+        shell: pwsh
+        run: |
+          Get-ChildItem -Recurse -Filter 'Civil Awareness Warrior*' | ForEach-Object {
+            Rename-Item -LiteralPath $_.FullName -NewName $_.Name.Replace('Civil Awareness Warrior', 'civil-awareness-warrior')
+          }
+
       # Windows bonus artifact: the bare exe in a zip, for volunteers who
       # want no installer. Needs the WebView2 runtime the OS already ships
       # on Windows 10+ (the NSIS installer carries a bootstrapper for
@@ -104,8 +139,8 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Compress-Archive -Path src-tauri/target/release/lh-contributor-gui.exe `
-            -DestinationPath dist/lh-contributor-gui-portable.zip
+          Compress-Archive -Path src-tauri/target/release/civil-awareness-warrior.exe `
+            -DestinationPath dist/civil-awareness-warrior-portable.zip
 
       - name: Upload bundles for the release
         uses: actions/upload-artifact@v4
@@ -139,7 +174,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: LandHunter Contributor ${{ github.ref_name }}
+          name: Civil Awareness Warrior ${{ github.ref_name }}
           files: dist/**
           prerelease: ${{ inputs.prerelease == true }}
           generate_release_notes: true

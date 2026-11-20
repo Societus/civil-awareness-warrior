@@ -25,10 +25,18 @@ fn main() {
         // README autostart section covers headless/console-login caveats).
         // No args are passed to the autostarted launch; every call is
         // Rust-side so no webview permission is added.
-        .plugin(tauri_plugin_autostart::init(
-            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            Some(vec![]),
-        ))
+        //
+        // app_name is PINNED instead of defaulting to the productName: the
+        // entry's file name / Run-key value / plist Label must stay a
+        // stable space-free identifier across display-name changes (the
+        // Civil Awareness Warrior rebrand would otherwise rename the OS
+        // entry to "Civil Awareness Warrior …" and orphan the old file).
+        // macOS launcher stays the builder default (LaunchAgent).
+        .plugin(
+            tauri_plugin_autostart::Builder::new()
+                .app_name("civil-awareness-warrior")
+                .build(),
+        )
         .setup(|app| {
             let handle = app.handle().clone();
 
@@ -81,7 +89,7 @@ fn main() {
             TrayIconBuilder::with_id(contributor::TRAY_ID)
                 .menu(&menu)
                 .show_menu_on_left_click(false)
-                .tooltip("LandHunter Contributor")
+                .tooltip("Civil Awareness Warrior")
                 .icon(
                     handle
                         .default_window_icon()

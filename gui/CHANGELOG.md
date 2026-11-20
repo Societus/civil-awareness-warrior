@@ -7,6 +7,30 @@ sync-version` stamps `package.json` + `src-tauri/Cargo.toml` (every
 
 ## [Unreleased]
 
+- **Rebrand to Civil Awareness Warrior** (repo already renamed on GitHub
+  to `Societus/civil-awareness-warrior`). New laurel-ring "CAW" emblem
+  icons everywhere — desktop set, Windows Square/Store logos, iOS and
+  Android — regenerated from `gui/src-tauri/icons/source-emblem.png`
+  (the canonical source for future regenerations; artwork untouched).
+  The superseded `gui/app-icon.svg` (old-brand icon source) is removed —
+  it had no remaining references.
+  Display surfaces now carry the new name: window title, tray tooltip,
+  dashboard headline, installer short/long description, GitHub Release
+  name and README.
+- Rebrand naming decisions: `productName` is the display name
+  "Civil Awareness Warrior"; `mainBinaryName` is pinned to
+  `civil-awareness-warrior` so the executable (and the Windows portable
+  zip) stays space-free; release artifacts are renamed to the kebab name
+  by the workflow, since Tauri 2 derives bundle file names from
+  `productName` verbatim (upstream tauri#13999) and GitHub upload would
+  otherwise mangle spaces to dots. The autostart plugin's `app_name` is
+  pinned to `civil-awareness-warrior` for the same stability reason.
+- Deliberately unchanged internal identifiers: Cargo/npm package names,
+  the `lh-contributor-client` SDK crate and repo paths, the bundle
+  identifier `app.landhunter.contributor-gui` — so every platform's
+  app-data dir (credentials, settings, downloaded models) survives the
+  rename untouched. The SDK's HTTP User-Agent (`lh-contributor-gui/0.1.0
+  …`) is a protocol identifier, not branding, and stays.
 - Release signing/notarization (NSIS `signCommand`, macOS
   `signingIdentity` + notarytool) — blocked on operator signing
   credentials, not on code.

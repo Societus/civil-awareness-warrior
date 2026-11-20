@@ -1,9 +1,9 @@
-# lh-contributor-gui
+# Civil Awareness Warrior
 
-Tauri 2 graphical wrapper for the LandHunter contributor SDK
-(`lh-contributor-client`, embedded as a path dependency at `../../sdk` —
-this directory is the `gui/` subtree of the `lh-contributor` monorepo).
-Background-posture tray app: the window is a
+Tauri 2 graphical wrapper for the Civil Awareness Warrior volunteer
+client (the `lh-contributor-client` SDK crate, embedded as a path
+dependency at `../../sdk` — this directory is the `gui/` subtree of the
+monorepo). Background-posture tray app: the window is a
 status dashboard; the warrior run loop lives in a background task and keeps
 running after the window is closed.
 
@@ -13,15 +13,15 @@ Built installers live on this repository's **Releases** page (the release
 pipeline is described under [Releasing (operator)](#releasing-operator)).
 Pick your platform:
 
-- **Windows 10/11 (x64):** `lh-contributor-gui_<version>_x64-setup.exe`
+- **Windows 10/11 (x64):** `civil-awareness-warrior_<version>_x64-setup.exe`
   — an NSIS installer that installs *for your user only* (no admin
   rights, no system-wide footprint). Portable alternative:
-  `lh-contributor-gui-portable.zip` is the bare exe — unpack anywhere and
+  `civil-awareness-warrior-portable.zip` is the bare exe — unpack anywhere and
   run; Windows 10+ already ships the WebView2 runtime the app needs.
 - **macOS 13+ (Apple Silicon or Intel):** the universal `.dmg` — open it
-  and drag **lh-contributor-gui.app** into Applications.
+  and drag **Civil Awareness Warrior.app** into Applications.
 - **Linux (x86_64):** the `.deb` (Debian/Ubuntu-family:
-  `sudo apt install ./lh-contributor-gui_<version>_amd64.deb`) or the
+  `sudo apt install ./civil-awareness-warrior_<version>_amd64.deb`) or the
   `.AppImage` (any modern distro: `chmod +x` and run; the first run adds
   an applications-menu entry).
 
@@ -66,9 +66,9 @@ is a human action. When on, the app registers a **per-user** entry:
 
 | Platform | Where the entry lives |
 | --- | --- |
-| Windows | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` value |
-| Linux | `~/.config/autostart/lh-contributor-gui.desktop` (XDG autostart; the AppImage registers the AppImage itself, the deb package registers the installed binary) |
-| macOS | LaunchAgent plist in `~/Library/LaunchAgents` (label `app.landhunter.contributor-gui`) |
+| Windows | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` value `civil-awareness-warrior` |
+| Linux | `~/.config/autostart/civil-awareness-warrior.desktop` (XDG autostart; the AppImage registers the AppImage itself, the deb package registers the installed binary) |
+| macOS | LaunchAgent plist `~/Library/LaunchAgents/civil-awareness-warrior.plist` (label `civil-awareness-warrior`) |
 
 How it stays honest:
 
@@ -104,14 +104,14 @@ Manual patterns (from a console Terminal; the in-app switch effectively
 does the same):
 
 ```sh
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/app.landhunter.contributor-gui.plist
-launchctl print   gui/$(id -u)/app.landhunter.contributor-gui  # status
-launchctl bootout gui/$(id -u)/app.landhunter.contributor-gui  # unload
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/civil-awareness-warrior.plist
+launchctl print   gui/$(id -u)/civil-awareness-warrior  # status
+launchctl bootout gui/$(id -u)/civil-awareness-warrior  # unload
 ```
 
 LaunchDaemon variant: copy the plist the app wrote into
 `/Library/LaunchDaemons/`, add a `UserName` key pinned to the intended
-account, then `launchctl bootstrap system /Library/LaunchDaemons/app.landhunter.contributor-gui.plist`
+account, then `launchctl bootstrap system /Library/LaunchDaemons/civil-awareness-warrior.plist`
 — with the GUI caveat above.
 
 ## Upgrading
@@ -122,6 +122,17 @@ install the newest release over the old:
 - Windows: run the new `-setup.exe` — it installs in place.
 - macOS: drag the new app onto the old one in Applications.
 - Linux: `sudo apt install ./<new>.deb`, or just replace the AppImage file.
+
+**One-time note for the Civil Awareness Warrior rename (0.1.0):** the
+Windows install directory, the Linux deb package name and the macOS `.app`
+name all follow the (new) product name, so the FIRST upgrade after the
+rebrand installs alongside the old one instead of replacing it. App state
+is keyed by the unchanged identifier — credentials, settings and
+downloaded models carry over untouched. Afterwards the old install can be
+removed once (uninstall the old Windows entry / `apt remove` the old
+package / drag the old app to Trash) and a stale old launch-at-login file
+(`lh-contributor-gui.desktop` / `.plist` / HKCU value) deleted; the app
+re-registers its own entry under the new name on the next launch.
 
 App state (see *Credentials & data location*) is never touched by
 install or uninstall: registration identity, settings, and **downloaded
@@ -142,7 +153,8 @@ the three disagree. Releasing a new version means editing **one** file.
 **One-time setup** — monorepo edition: `sdk/` and `gui/` live in ONE repo,
 so the release workflow needs a single checkout and no sibling-repo token:
 
-1. Create the GitHub repo (`lh-contributor`) in the org and push `main`
+1. Create the GitHub repo (`lh-contributor`, since renamed on GitHub to
+   `civil-awareness-warrior`) in the org and push `main`
    once. `.github/workflows/release.yml` (repo root) builds all three
    platforms from that single checkout — the old sibling-repo checkout
    step and `LH_CONTRIBUTOR_CLIENT_TOKEN` secret are gone.
@@ -153,8 +165,11 @@ so the release workflow needs a single checkout and no sibling-repo token:
 What the pipeline (`.github/workflows/release.yml`) does on a `v*` tag
 push: builds **Linux** (deb + AppImage), **Windows** (NSIS installer +
 portable zip) and **macOS** (universal dmg, arm64+x86_64, on the
-macos-14 runner) in parallel, then publishes one GitHub Release named
-`LandHunter Contributor <tag>` carrying every artifact — as a full
+macos-14 runner) in parallel, renames bundle artifacts to the kebab
+`civil-awareness-warrior_*` naming (Tauri derives bundle file names from
+the display productName, and GitHub asset upload would mangle the spaces),
+then publishes one GitHub Release named
+`Civil Awareness Warrior <tag>` carrying every artifact — as a full
 (non-prerelease) release.
 
 Artifacts are **not code-signed/notarized yet** — the next operator

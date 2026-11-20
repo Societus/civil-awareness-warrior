@@ -335,7 +335,7 @@
 	<header>
 		<div class="brand">
 			<span class="logo" aria-hidden="true">⌖</span>
-			<h1>LandHunter Contributor</h1>
+			<h1>Civil Awareness Warrior</h1>
 		</div>
 		<span class="conn">
 			<span class="pill {coordinatorPill}" role="status">
