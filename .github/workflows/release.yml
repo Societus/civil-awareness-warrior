@@ -188,7 +188,14 @@ jobs:
 
       - name: Generate SHA256SUMS
         working-directory: dist
-        run: find . -type f -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+        # flatten the per-artifact subdirs (asset names are flat on the
+        # release), then hash everything except SHA256SUMS itself — a
+        # self-entry can never verify (fixed live on the v0.1.0 asset)
+        run: |
+          find . -mindepth 2 -type f -exec mv {} . \;
+          find . -mindepth 1 -type d -empty -delete
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 | sort -z \
+            | xargs -0 sha256sum > SHA256SUMS
 
       - name: Publish the GitHub Release
         uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4 (node 24)
