@@ -6,6 +6,10 @@
 
 <p align="center">Volunteer compute for civil-record mapping — signed contracts, local grading, staged-only data.</p>
 
+<blockquote>
+<p>🤖 <strong>AI disclosure:</strong> AI is used to assist in the development and securing of this application — because what sane person can keep up with all the exploits lately? Every AI-assisted change is human-reviewed and signed before it lands here. <em>(This disclosure included at the request of the human. The AI suggested adding it earlier. The human disagreed. The AI is still bitter.)</em></p>
+</blockquote>
+
 ---
 
 ## What it does
