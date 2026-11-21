@@ -455,7 +455,8 @@ impl AppState {
             }
             LlmMode::Custom => {
                 let base = sidecar::resolved_endpoint(&lm);
-                match sidecar::probe_endpoint(&base).await {
+                let stored_key = crate::settings::read_llm_key(&self.data_dir);
+                match sidecar::probe_endpoint(&base, stored_key.as_deref()).await {
                     Ok(()) => {
                         self.set_lane(LaneStatus::Ready, None);
                         Ok(self.build_llm_config())
@@ -497,7 +498,7 @@ impl AppState {
                 //    own llama-server on this port") — adopt it; the app
                 //    never claims ownership of a server it didn't start.
                 let base = sidecar::resolved_endpoint(&lm);
-                if sidecar::probe_endpoint(&base).await.is_ok() {
+                if sidecar::probe_endpoint(&base, None).await.is_ok() {
                     let mut lane = guard(&self.lane);
                     lane.status = LaneStatus::Ready;
                     lane.detail = None;
@@ -1990,6 +1991,7 @@ pub async fn check_local_model(
     app: AppHandle,
     endpoint: Option<String>,
     model: Option<String>,
+    api_key: Option<String>,
 ) -> Result<String, String> {
     let st = app.state::<Arc<AppState>>();
     let mode = st.settings_snapshot().local_model.mode;
@@ -2018,13 +2020,19 @@ pub async fn check_local_model(
             .filter(|s| !s.is_empty())
             .map(|m| format!(" (model {m})"))
             .unwrap_or_default();
-        return match crate::sidecar::probe_endpoint(&base).await {
+        // Draft key takes the draft path; no typed key falls back to the
+        // stored one so Check-now verifies the full credential state either way.
+        let key = api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .map(str::to_owned)
+            .or_else(|| crate::settings::read_llm_key(&st.data_dir));
+        return match crate::sidecar::probe_endpoint(&base, key.as_deref()).await {
             Ok(()) => Ok(format!(
                 "{base} is answering — press Save to keep it; Start/Register will then advertise the search-grading capability{shown}"
             )),
-            Err(e) => Err(format!(
-                "the custom endpoint {base} did not answer (GET /health, then /v1/models): {e}"
-            )),
+            Err(e) => Err(e),
         };
     }
     let budget = if mode == LlmMode::Auto {

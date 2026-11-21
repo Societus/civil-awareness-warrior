@@ -756,7 +756,7 @@
 					{#if llm?.detail}
 						<p class="fine lm-detail">{llm.detail}</p>
 					{/if}
-					<button onclick={() => lmAction('check_local_model', 'Endpoint check', { endpoint: draft.local_model.endpoint, model: draft.local_model.model_name })} disabled={busy}>Check now</button>
+					<button onclick={() => lmAction('check_local_model', 'Endpoint check', { endpoint: draft.local_model.endpoint, model: draft.local_model.model_name, api_key: draft.llm_api_key })} disabled={busy}>Check now</button>
 				{/if}
 
 				<div>

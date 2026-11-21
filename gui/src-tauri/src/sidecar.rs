@@ -339,7 +339,7 @@ pub fn custom_endpoint_kind(url_str: &str) -> lh_contributor_client::api::LlmEnd
 
 /// Probe an OpenAI-compatible endpoint: llama-server's `/health` at the
 /// origin root first, then `{base}/models`. Any 2xx on either means healthy.
-pub async fn probe_endpoint(base: &str) -> Result<(), String> {
+pub async fn probe_endpoint(base: &str, api_key: Option<&str>) -> Result<(), String> {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(4))
         .build()
@@ -366,15 +366,35 @@ pub async fn probe_endpoint(base: &str) -> Result<(), String> {
     let health_url = format!("{origin}/health");
     let models_url = format!("{base_norm}/models");
 
+    // Bearer auth on both probes so a key-requiring endpoint is actually
+    // testable with the key the operator typed/stored. The key is only ever
+    // sent as this header — never logged, never echoed into error text.
+    let auth = |req: reqwest::RequestBuilder| {
+        if let Some(k) = api_key.filter(|k| !k.trim().is_empty()) {
+            req.bearer_auth(k.trim())
+        } else {
+            req
+        }
+    };
+
     // The health-probe failure message, carried into the models-probe
     // error text (why we fell back).
-    let health_msg = match client.get(&health_url).send().await {
+    let health_msg = match auth(client.get(&health_url)).send().await {
         Ok(r) if r.status().is_success() => return Ok(()),
         Ok(r) => format!("GET {health_url} → {}", r.status()),
         Err(e) => format!("GET {health_url} → {e}"),
     };
-    match client.get(&models_url).send().await {
+    match auth(client.get(&models_url)).send().await {
         Ok(r) if r.status().is_success() => Ok(()),
+        Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED && api_key.is_none() => Err(format!(
+            "endpoint requires an API key (401 unauthorized from {models_url}) — supply one under API key"
+        )),
+        Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED => Err(format!(
+            "credentials rejected (401 unauthorized from {models_url}) — the API key supplied was not accepted"
+        )),
+        Ok(r) if r.status() == reqwest::StatusCode::FORBIDDEN => Err(format!(
+            "credentials rejected (403 forbidden from {models_url}) — the key was recognized but not allowed to list models"
+        )),
         Ok(r) => Err(format!("endpoint unreachable ({health_msg}; GET {models_url} → {})", r.status())),
         Err(e) => Err(format!("endpoint unreachable ({health_msg}; GET {models_url} → {e})")),
     }
@@ -384,7 +404,7 @@ pub async fn wait_healthy(base: &str, budget: Duration) -> Result<(), String> {
     let started = Instant::now();
     let mut last_err = String::new();
     while started.elapsed() < budget {
-        match probe_endpoint(base).await {
+        match probe_endpoint(base, None).await {
             Ok(()) => return Ok(()),
             Err(e) => last_err = e,
         }
@@ -1858,12 +1878,51 @@ mod tests {
     #[tokio::test]
     async fn probe_prefers_health_then_falls_back_to_models() {
         let base = spawn_probe_server(200, 404);
-        probe_endpoint(&base).await.expect("health 200 is healthy");
+        probe_endpoint(&base, None).await.expect("health 200 is healthy");
         let base2 = spawn_probe_server(404, 200);
-        probe_endpoint(&base2).await.expect("models 200 fallback is healthy");
+        probe_endpoint(&base2, None).await.expect("models 200 fallback is healthy");
         let base3 = spawn_probe_server(503, 503);
-        let err = probe_endpoint(&base3).await.unwrap_err();
+        let err = probe_endpoint(&base3, None).await.unwrap_err();
         assert!(err.contains("unreachable"), "{err}");
+    }
+
+    /// The probe must actually send the API key as a bearer token and
+    /// distinguish three outcomes: correct key → healthy, wrong key →
+    /// "credentials rejected", no key against an auth-requiring endpoint →
+    /// "requires an API key". (401-on-models regression: the key box was
+    /// never testable before or after save.)
+    #[tokio::test]
+    async fn probe_sends_bearer_and_reports_credential_rejection() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind auth probe server");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let authorized = req.to_ascii_lowercase().contains("bearer right-key");
+                let (status, body) = if authorized {
+                    (200, r#"{"ok":true}"#.to_string())
+                } else {
+                    (401, r#"{"error":"unauthorized"}"#.to_string())
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        let base = format!("http://127.0.0.1:{port}/v1");
+        probe_endpoint(&base, Some("right-key"))
+            .await
+            .expect("correct key probes healthy");
+        let err = probe_endpoint(&base, Some("wrong-key")).await.unwrap_err();
+        assert!(err.contains("credentials rejected"), "{err}");
+        let err = probe_endpoint(&base, None).await.unwrap_err();
+        assert!(err.contains("requires an API key"), "{err}");
     }
 
     #[test]
@@ -2372,7 +2431,7 @@ main()
         // The stub is a python script: give the interpreter time to boot.
         let mut healthy = false;
         for _ in 0..50 {
-            if probe_endpoint(&c.endpoint).await.is_ok() {
+            if probe_endpoint(&c.endpoint, None).await.is_ok() {
                 healthy = true;
                 break;
             }
