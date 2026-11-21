@@ -201,20 +201,32 @@
 		}
 	}
 
+	/** Per-button pending indicator + inline results for the test actions.
+	 *  The dialog is long — results were only ever visible in the top
+	 *  banner, and the only in-progress signal was the disabled attribute. */
+	let pendingLabel = $state('');
+	let coordResult = $state(/** @type {{ok: boolean, text: string} | null} */ (null));
+	let lmResult = $state(/** @type {{ok: boolean, text: string} | null} */ (null));
+
 	async function testConnection() {
 		if (!inTauri) {
 			note = 'Connection test is only available in the real app — demo mode has no network side.';
 			return;
 		}
 		busy = true;
+		pendingLabel = 'Test connection';
 		note = '';
 		errors = {};
 		try {
-			note = String(await invoke('check_coordinator'));
+			const r = String(await invoke('check_coordinator', { url: draft.coordinator_url }));
+			coordResult = { ok: true, text: r };
+			note = r;
 			await onChanged?.();
 		} catch (e) {
+			coordResult = { ok: false, text: String(e) };
 			errors = toFieldErrors(e);
 		} finally {
+			pendingLabel = '';
 			busy = false;
 		}
 	}
@@ -357,14 +369,19 @@
 			return;
 		}
 		busy = true;
+		pendingLabel = label;
 		note = '';
 		errors = {};
 		try {
-			note = String(await invoke(cmd, args ?? {}));
+			const r = String(await invoke(cmd, args ?? {}));
+			if (cmd === 'check_local_model') lmResult = { ok: true, text: r };
+			note = r;
 			await onChanged?.();
 		} catch (e) {
+			if (cmd === 'check_local_model') lmResult = { ok: false, text: String(e) };
 			errors = toFieldErrors(e);
 		} finally {
+			pendingLabel = '';
 			busy = false;
 		}
 	}
@@ -536,7 +553,10 @@
 					<p class="field-error" role="alert">{errors.public_key_hex}</p>
 				{/if}
 			</div>
-			<button onclick={testConnection} disabled={busy}>Test connection</button>
+			<button onclick={testConnection} disabled={busy}>{pendingLabel === 'Test connection' ? 'Testing…' : 'Test connection'}</button>
+			{#if coordResult}
+				<p class="fine action-result {coordResult.ok ? 'result-ok' : 'result-err'}">{coordResult.text}</p>
+			{/if}
 		</section>
 
 		<section class="settings-section" aria-labelledby="ident-title">
@@ -666,8 +686,11 @@
 						<p class="fine lm-detail">{llm.detail}</p>
 						{/if}
 						<div class="settings-actions">
-						<button onclick={() => lmAction('download_local_model', 'Model download')} disabled={busy}>Download model</button>
-						<button onclick={() => lmAction('check_local_model', 'Endpoint check')} disabled={busy}>Check now</button>
+						<button onclick={() => lmAction('download_local_model', 'Model download')} disabled={busy}>{pendingLabel === 'Model download' ? 'Downloading…' : 'Download model'}</button>
+						<button onclick={() => lmAction('check_local_model', 'Endpoint check')} disabled={busy}>{pendingLabel === 'Endpoint check' ? 'Checking…' : 'Check now'}</button>
+						{#if lmResult}
+							<p class="fine action-result {lmResult.ok ? 'result-ok' : 'result-err'}">{lmResult.text}</p>
+						{/if}
 						<button class="danger" onclick={() => lmAction('delete_local_model', 'Free disk')} disabled={busy}>Free disk</button>
 						</div>
 						<div class="settings-actions">
@@ -756,7 +779,10 @@
 					{#if llm?.detail}
 						<p class="fine lm-detail">{llm.detail}</p>
 					{/if}
-					<button onclick={() => lmAction('check_local_model', 'Endpoint check', { endpoint: draft.local_model.endpoint, model: draft.local_model.model_name, api_key: draft.llm_api_key })} disabled={busy}>Check now</button>
+					<button onclick={() => lmAction('check_local_model', 'Endpoint check', { endpoint: draft.local_model.endpoint, model: draft.local_model.model_name, api_key: draft.llm_api_key })} disabled={busy}>{pendingLabel === 'Endpoint check' ? 'Checking…' : 'Check now'}</button>
+					{#if lmResult}
+						<p class="fine action-result {lmResult.ok ? 'result-ok' : 'result-err'}">{lmResult.text}</p>
+					{/if}
 				{/if}
 
 				<div>

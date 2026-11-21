@@ -617,6 +617,18 @@ footer {
 	margin: 0;
 }
 
+/* inline result of the Test connection / Check now actions */
+.action-result {
+	font-size: 11.5px;
+	margin: 0.25rem 0 0;
+}
+.result-ok {
+	color: var(--ok, #2d7d4a);
+}
+.result-err {
+	color: var(--err);
+}
+
 .settings-actions {
 	display: grid;
 	grid-template-columns: 1fr 1fr;

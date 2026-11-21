@@ -1897,9 +1897,22 @@ pub fn unregister_identity(app: AppHandle) -> Result<String, String> {
 }
 
 #[tauri::command]
-pub async fn check_coordinator(app: AppHandle) -> Result<String, String> {
+pub async fn check_coordinator(app: AppHandle, url: Option<String>) -> Result<String, String> {
     let st = app.state::<Arc<AppState>>();
-    let api = st.api_client()?;
+    // Draft override: a coordinator URL typed but not yet saved is invisible
+    // to the saved snapshot — validate exactly like save and probe the draft.
+    let api = match url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(draft_url) => {
+            if !draft_url.starts_with("http://") && !draft_url.starts_with("https://") {
+                return Err("coordinator URL must start with http:// or https://".to_string());
+            }
+            url::Url::parse(draft_url)
+                .map_err(|_| "coordinator URL is not a valid URL".to_string())?;
+            ApiClient::new(draft_url, Duration::from_secs(10))
+                .map_err(|e| format!("bad coordinator URL: {e}"))?
+        }
+        None => st.api_client()?,
+    };
     match api.health().await {
         Ok(h) => {
             st.coordinator_ok.store(1, Ordering::Relaxed);
