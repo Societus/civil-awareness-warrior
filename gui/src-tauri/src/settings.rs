@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const DEFAULT_COORDINATOR: &str = "https://cap.landhunter.app";
+pub const DEFAULT_COORDINATOR: &str = "https://caw.landhunter.app";
 
 /// Validation failure tied to a settings field. Serialized into the webview
 /// rejection so the dialog can render the message under the exact control

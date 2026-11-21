@@ -14,13 +14,11 @@
     "windows": [
       {
         "title": "Civil Awareness Warrior",
-        "width": 360,
-        "height": 480,
-        "resizable": false,
-        "minWidth": 360,
-        "maxWidth": 360,
+        "width": 960,
+        "height": 720,
+        "resizable": true,
+        "minWidth": 640,
         "minHeight": 480,
-        "maxHeight": 480,
         "center": true
       }
     ],

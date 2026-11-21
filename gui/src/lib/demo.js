@@ -59,7 +59,7 @@ const CAP_KEYS = ['examination', 'ingest', 'alt_source', 'state_walk', 'search']
 
 function defaultSettings() {
 	return {
-		coordinator_url: 'https://cap.landhunter.app',
+		coordinator_url: 'https://caw.landhunter.app',
 		public_key_hex: '',
 		concurrency: 2,
 		dry_run: true,
