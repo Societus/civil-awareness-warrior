@@ -1687,7 +1687,13 @@ fn slot_out(i: usize, act: &SlotActivity, targets: &HashMap<String, String>) -> 
 
 fn settings_view(st: &AppState) -> SettingsView {
     let s = st.settings_snapshot();
-    let key = s.resolved_public_key();
+    // The dialog's key field is an "advanced" override on top of the pinned
+    // binary key: `configured`/`tail` describe the STORED override (what
+    // "leave blank to keep" actually keeps), not the effective resolved key
+    // — with the compile-time pin in place the resolved key is never empty,
+    // and using it here would mislabel a blank field as an existing entry.
+    // The run loop's build_config keeps resolving the full chain.
+    let stored_key = s.public_key_hex.trim().to_string();
     let creds_present = st.creds_path().exists();
     let staging_mode = AppState::staging_mode(&s);
     SettingsView {
@@ -1698,9 +1704,9 @@ fn settings_view(st: &AppState) -> SettingsView {
         schedule: s.schedule.clone(),
         autostart: s.autostart,
         staging_mode,
-        public_key_configured: !key.is_empty(),
-        public_key_tail: if key.len() >= 6 {
-            key[key.len() - 6..].to_string()
+        public_key_configured: !stored_key.is_empty(),
+        public_key_tail: if stored_key.len() >= 6 {
+            stored_key[stored_key.len() - 6..].to_string()
         } else {
             String::new()
         },

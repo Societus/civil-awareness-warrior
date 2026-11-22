@@ -2,7 +2,9 @@
 //!
 //! First launch seeds defaults from the LH_* environment, writes them to
 //! `settings.json`, and from then on the file wins (the env public key is
-//! still honored as a fallback when the stored key is empty).
+//! still honored as a fallback when the stored key is empty, and the
+//! compile-time `PUBLIC_KEY_HEX_DEFAULT` is the final fallback so a stock
+//! install can Start without any key entry at all).
 //!
 //! New fields (`capabilities`, `schedule`) carry `serde(default)` so a
 //! settings.json written by an older build still loads — the old file simply
@@ -14,6 +16,18 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_COORDINATOR: &str = "https://caw.landhunter.app";
+
+/// Compile-time contract public key: the operator's ed25519 signing key,
+/// 64-char hex. Public by definition — it only verifies signatures on
+/// leases the tracker hands out — so pinning it in the binary is what lets
+/// a volunteer press Start without ever pasting hex. Rotation = a new
+/// release. Release prep swaps the placeholder for the real value from the
+/// operator's keypair records (it never travels through chat): until then
+/// `build_config` keeps failing closed exactly like the pre-pin
+/// empty-Settings path. Resolution order lives in
+/// `GuiSettings::resolved_public_key`: stored Settings value →
+/// LH_PUBLIC_KEY_HEX env → this const.
+pub const PUBLIC_KEY_HEX_DEFAULT: &str = "REPLACE_ME_BEFORE_RELEASE_64_HEX";
 
 /// Validation failure tied to a settings field. Serialized into the webview
 /// rejection so the dialog can render the message under the exact control
@@ -328,8 +342,10 @@ pub fn in_window_minutes(minute_of_day: u32, schedule: &ScheduleCfg) -> bool {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GuiSettings {
     pub coordinator_url: String,
-    /// Stored ed25519 contract key (64 hex). Empty = fall back to
-    /// LH_PUBLIC_KEY_HEX at run time.
+    /// Stored ed25519 contract key (64 hex). Optional "advanced" override:
+    /// empty falls back to LH_PUBLIC_KEY_HEX, then to the compile-time
+    /// PUBLIC_KEY_HEX_DEFAULT (`resolved_public_key`). Volunteers get the
+    /// pinned key from the binary and leave this blank.
     pub public_key_hex: String,
     pub concurrency: u32,
     pub dry_run: bool,
@@ -448,16 +464,24 @@ impl GuiSettings {
         };
     }
 
-    /// Effective contract key: stored value first, env as fallback.
+    /// Effective contract key: stored value first, then LH_PUBLIC_KEY_HEX,
+    /// then the compile-time pin. An empty-after-trim value at any step
+    /// keeps falling through, so a blank Settings field on a stock install
+    /// resolves to PUBLIC_KEY_HEX_DEFAULT and Start needs no user input
+    /// (build_config's 64-hex guard accepts it once the const is filled).
     pub fn resolved_public_key(&self) -> String {
         let stored = self.public_key_hex.trim();
         if !stored.is_empty() {
             return stored.to_string();
         }
-        std::env::var("LH_PUBLIC_KEY_HEX")
+        let from_env = std::env::var("LH_PUBLIC_KEY_HEX")
             .unwrap_or_default()
             .trim()
-            .to_string()
+            .to_string();
+        if !from_env.is_empty() {
+            return from_env;
+        }
+        PUBLIC_KEY_HEX_DEFAULT.trim().to_string()
     }
 
     /// Whole-settings validation (field-keyed). `save_settings` applies a
@@ -1330,5 +1354,69 @@ mod tests {
         assert_eq!(s.local_model.llama_server_bin, good.to_str().unwrap(), "valid override survives load");
         assert!(s.validate().is_ok());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolved_public_key_falls_back_stored_then_env_then_const() {
+        // The env is process-global and cargo runs tests in parallel
+        // threads: hold a lock for the whole chain walk and restore the
+        // caller's env on the way out (Drop runs even on a failed assert).
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        struct RestoreEnv;
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                std::env::remove_var("LH_PUBLIC_KEY_HEX");
+            }
+        }
+        let _restore = RestoreEnv;
+        let settings_with_key = |stored: &str| GuiSettings {
+            coordinator_url: "https://ok.test".to_string(),
+            public_key_hex: stored.to_string(),
+            concurrency: 2,
+            dry_run: true,
+            capabilities: Capabilities::default(),
+            schedule: ScheduleCfg::default(),
+            local_model: LocalModelCfg::default(),
+            autostart: false,
+        };
+
+        // Chain end: nothing stored, nothing in the env → the compile-time
+        // pin, verbatim. Whatever the const holds (placeholder today, the
+        // operator's real key at release prep) is exactly what Start
+        // resolves to with zero user input.
+        std::env::remove_var("LH_PUBLIC_KEY_HEX");
+        assert_eq!(settings_with_key("").resolved_public_key(), PUBLIC_KEY_HEX_DEFAULT);
+        assert_eq!(
+            settings_with_key("   ").resolved_public_key(),
+            PUBLIC_KEY_HEX_DEFAULT,
+            "whitespace-only stored value keeps falling"
+        );
+
+        // Env arm: blank stored field, env set → env beats the const.
+        let env_key = format!("cd{}", "ab".repeat(30));
+        std::env::set_var("LH_PUBLIC_KEY_HEX", format!("  {env_key}  "));
+        assert_eq!(
+            settings_with_key("").resolved_public_key(),
+            env_key,
+            "env value is trimmed"
+        );
+        std::env::set_var("LH_PUBLIC_KEY_HEX", "   ");
+        assert_eq!(
+            settings_with_key("").resolved_public_key(),
+            PUBLIC_KEY_HEX_DEFAULT,
+            "whitespace-only env keeps falling to the const"
+        );
+
+        // Stored arm: a saved Settings value beats env and const alike.
+        let stored = "ab".repeat(32);
+        std::env::set_var("LH_PUBLIC_KEY_HEX", &env_key);
+        assert_eq!(
+            settings_with_key(&stored).resolved_public_key(),
+            stored,
+            "stored value wins over both fallbacks"
+        );
     }
 }

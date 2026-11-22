@@ -546,7 +546,7 @@
 					type="text"
 					spellcheck="false"
 					bind:value={draft.public_key_hex}
-					placeholder={view?.public_key_configured ? `unchanged (…${view.public_key_tail})` : '64-char hex, or set LH_PUBLIC_KEY_HEX'}
+					placeholder={view?.public_key_configured ? `unchanged (…${view.public_key_tail})` : 'advanced — pre-filled automatically; leave blank unless your operator told you otherwise'}
 					autocomplete="off"
 				/>
 				{#if errors.public_key_hex}
