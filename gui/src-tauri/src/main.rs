@@ -147,6 +147,7 @@ fn main() {
             contributor::unregister_identity,
             contributor::check_coordinator,
             contributor::operator_key_info,
+            contributor::operator_seed,
             contributor::get_settings_view,
             contributor::save_settings,
             contributor::community_stats,

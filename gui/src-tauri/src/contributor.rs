@@ -59,10 +59,11 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{Local, Timelike};
-use lh_contributor_client::api::{ApiClient, Credentials, LlmCapability, LlmEndpointKind};
+use lh_contributor_client::api::{ApiClient, ChunkType, Credentials, LlmCapability, LlmEndpointKind, SignedChunkContract};
 use lh_contributor_client::config::{
     credentials_file_for, load_credentials_for, save_credentials, Config, LlmConfig, StagingConfig,
 };
+use lh_contributor_client::crypto::verify_contract;
 use lh_contributor_client::stats::SlotActivity;
 use lh_contributor_client::{register_request, register_request_with_llm, RunOptions, Runner, StatsHandle};
 use serde::{Deserialize, Serialize};
@@ -1555,6 +1556,9 @@ pub struct SettingsView {
     /// The persisted Local Model config (form initial values). The API key
     /// is deliberately absent — SettingsView exposes only `llm` (LlmView).
     pub local_model: settings::LocalModelCfg,
+    /// Operator issuance settings (form initial values). The CF bearer token
+    /// is deliberately absent — it lives in its own 0600 file.
+    pub operator: settings::OperatorCfg,
     /// The Auto-configure bundled model menu straight from
     /// sidecar::bundled_models (index 0 = the default). The Rust list is the
     /// ground truth the Settings select renders; settings-util.js mirrors it
@@ -1605,6 +1609,18 @@ pub struct LocalModelIn {
 }
 
 #[derive(Deserialize)]
+pub struct OperatorIn {
+    pub key_path: Option<String>,
+    pub cf_account_id: Option<String>,
+    pub cf_database_id: Option<String>,
+    /// Some replaces/deletes the stored CF bearer token (empty string = delete);
+    /// None leaves it untouched. The value goes straight to
+    /// operator_cf_token.json (0600, same protection class as credentials.json) —
+    /// never settings.json, never echoed back in any view.
+    pub cf_bearer_token: Option<String>,
+}
+
+#[derive(Deserialize)]
 pub struct SettingsInput {
     pub coordinator_url: Option<String>,
     pub public_key_hex: Option<String>,
@@ -1613,6 +1629,7 @@ pub struct SettingsInput {
     pub capabilities: Option<CapabilitiesIn>,
     pub schedule: Option<ScheduleIn>,
     pub local_model: Option<LocalModelIn>,
+    pub operator: Option<OperatorIn>,
     /// Launch-at-login: Some replaces the stored intent (save_settings then
     /// writes/removes the OS entry BEFORE persisting); None keeps it.
     pub autostart: Option<bool>,
@@ -1701,6 +1718,17 @@ fn merge_settings(current: &GuiSettings, input: &SettingsInput) -> GuiSettings {
             s.local_model.ctx_tokens = c;
         }
     }
+    if let Some(op) = &input.operator {
+        if let Some(k) = &op.key_path {
+            s.operator.key_path = k.trim().to_string();
+        }
+        if let Some(a) = &op.cf_account_id {
+            s.operator.cf_account_id = a.trim().to_string();
+        }
+        if let Some(d) = &op.cf_database_id {
+            s.operator.cf_database_id = d.trim().to_string();
+        }
+    }
     // classify follows the model mode, and endpoints normalize to /v1 —
     // before validate enforces the invariant.
     s.normalize_local_model();
@@ -1774,6 +1802,7 @@ fn settings_view(st: &AppState) -> SettingsView {
         credentials_present: creds_present,
         client_id: st.credentials().map(|c| c.client_id),
         local_model: s.local_model.clone(),
+        operator: s.operator.clone(),
         bundled_models: sidecar::bundled_models()
             .into_iter()
             .map(|m| BundledModelOut {
@@ -1907,6 +1936,510 @@ pub async fn operator_key_info(key_path: String) -> Result<OperatorKeyInfo, Stri
     })
     .await
     .map_err(|e| format!("key load task failed: {e}"))?
+}
+
+/// Operator issuance, step 2 of the seeding flow: read the targets CSV,
+/// parse optional canary answers, build and sign chunk contracts via the
+/// part-1 signing core, derive canary expected_result_hash values when the
+/// answers file is given, and either return the full manifest (dry_run=true,
+/// default) or POST the insert set to the Cloudflare D1 REST API.
+///
+/// Security: the private key file is read ONLY inside this function via
+/// spawn_blocking, its bytes are never logged/echoed/persisted; only the
+/// PATH is stored in settings. The CF bearer token is read from its own
+/// 0600 credential file. All code paths fail closed — on any error during
+/// the live insert path, NOTHING is sent to D1 (all-or-nothing).
+#[derive(serde::Deserialize)]
+pub struct OperatorSeedInput {
+    /// Path to targets CSV (columns: type,target_key[,priority,expected_duration_sec,lease_ttl_sec,staging_upload_prefix]).
+    pub targets_csv_path: String,
+    /// Optional path to canary answers CSV (columns: target_key,expected_result_hash).
+    pub canary_answers_path: Option<String>,
+    /// Dry-run mode: return manifest without touching D1. Default true.
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
+    /// Override expires_days (default 30).
+    #[serde(default = "default_expires_days")]
+    pub expires_days: u32,
+    /// Override schema_version (default 1).
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+    /// Override priority (default 0).
+    #[serde(default)]
+    pub priority: i32,
+    /// Override expected_duration_sec (default 3600).
+    #[serde(default = "default_expected_duration_sec")]
+    pub expected_duration_sec: u32,
+    /// Override lease_ttl_sec (default 7200).
+    #[serde(default = "default_lease_ttl_sec")]
+    pub lease_ttl_sec: u32,
+    /// Override staging_upload_prefix (default "").
+    #[serde(default)]
+    pub staging_upload_prefix: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_expires_days() -> u32 {
+    30
+}
+fn default_schema_version() -> u32 {
+    1
+}
+fn default_expected_duration_sec() -> u32 {
+    3600
+}
+fn default_lease_ttl_sec() -> u32 {
+    7200
+}
+
+#[derive(serde::Serialize)]
+pub struct OperatorSeedOutput {
+    pub manifest: serde_json::Value,
+    pub dry_run: bool,
+    pub chunks_count: usize,
+    pub canaries_count: usize,
+}
+
+#[tauri::command]
+pub async fn operator_seed(
+    app: AppHandle,
+    input: OperatorSeedInput,
+) -> Result<OperatorSeedOutput, String> {
+    let st = app.state::<Arc<AppState>>();
+    let settings = st.settings_snapshot();
+
+    // Read operator settings (key_path, cf_account_id, cf_database_id)
+    let key_path = settings.operator.key_path.trim();
+    if key_path.is_empty() {
+        return Err("operator key path not configured — set it in Settings ▸ Operator".to_string());
+    }
+    let cf_account_id = settings.operator.cf_account_id.trim();
+    if cf_account_id.is_empty() {
+        return Err("Cloudflare account ID not configured — set it in Settings ▸ Operator".to_string());
+    }
+    let cf_database_id = settings.operator.cf_database_id.trim();
+    if cf_database_id.is_empty() {
+        return Err("Cloudflare D1 database ID not configured — set it in Settings ▸ Operator".to_string());
+    }
+
+    // Load the private key and derive public key (for the operator to eyeball).
+    let key_path_buf = std::path::PathBuf::from(key_path);
+    if !key_path_buf.is_file() {
+        return Err(format!("no key file at {key_path}"));
+    }
+    let (signing_key, public_key_hex) = tauri::async_runtime::spawn_blocking(move || {
+        let pem = std::fs::read_to_string(&key_path_buf)
+            .map_err(|e| format!("cannot read key file: {e}"))?;
+        let key = lh_contributor_client::crypto::load_signing_key_pem(&pem)?;
+        let pub_hex = lh_contributor_client::crypto::signing_key_public_hex(&key);
+        Ok::<_, String>((key, pub_hex))
+    })
+    .await
+    .map_err(|e| format!("key load task failed: {e}"))??;
+
+    // Parse targets CSV
+    let targets = parse_targets_csv(&input.targets_csv_path)?;
+
+    // Parse canary answers if provided
+    let canary_answers = if let Some(path) = &input.canary_answers_path {
+        parse_canary_answers_csv(path)?
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    // Build chunk contracts
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let expires_at = now_ms + (input.expires_days as i64) * 86_400_000;
+
+    let mut records = Vec::new();
+    let mut canary_rows = Vec::new();
+
+    use lh_contributor_client::api::{ChunkType, SignedChunkContract};
+    use serde_json::json;
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
+    // Demo payloads (same as caw-issue-chunks.py DEMO_PAYLOADS)
+    let demo_payloads: HashMap<ChunkType, serde_json::Value> = [
+        (ChunkType::Ingest, json!({
+            "fetch_plan": {"base_url": "https://example.invalid", "method": "GET", "pages": [{"path": "/", "expect_content_type": "text/html"}], "rate_limit": {"requests_per_min": 10, "bytes_per_min": 500000}},
+            "reconciliation_rules": [{"field": "row_count", "expected": "non_empty"}]
+        })),
+        (ChunkType::Examination, json!({
+            "parser_id": "demo_parser", "staged_blob_key": "", "expected_measurements": [{"name": "row_count", "expected_type": "number"}]
+        })),
+        (ChunkType::AltSource, json!({
+            "candidate_urls": [], "probe_plan": {"enum_services": false, "count_groupby": false, "null_count": false, "pagination_test": false, "return_centroid_test": false}
+        })),
+        (ChunkType::StateWalk, json!({
+            "roster_slice": [], "walk_recipe": {"title_line_pattern": "", "mint_relation": "", "heading_capture": false}
+        })),
+        (ChunkType::Search, json!({
+            "query_plan": {"queries": [{"query": "demo", "max_results": 5}], "backend": "brave"}, "source_class_priority": []
+        })),
+        (ChunkType::Classify, json!({
+            "prompt_template_id": "demo_template", "rubric": {"objective": "demo", "relevant_criteria": [], "irrelevant_criteria": []}, "input": {"kind": "search_result_set", "query_plan": {"queries": [{"query": "demo", "max_results": 5}], "backend": "brave"}}, "verdict_schema": "classify_verdict_v1", "expected_verdicts": 3
+        })),
+    ].into_iter().collect();
+
+    for r in targets {
+        let chunk_id = Uuid::new_v4().to_string();
+        let contract = SignedChunkContract {
+            core: lh_contributor_client::api::ChunkContract {
+                chunk_type: r.chunk_type,
+                target_key: r.target_key.clone(),
+                payload: demo_payloads.get(&r.chunk_type).cloned().unwrap_or(serde_json::Value::Null),
+                schema_version: input.schema_version,
+            },
+            expires_at,
+            operator_signature_hex: String::new(),
+            staging_upload_prefix: if r.staging_upload_prefix.is_empty() { input.staging_upload_prefix.clone() } else { r.staging_upload_prefix },
+        };
+
+        // Sign the contract
+        let signed_contract = lh_contributor_client::crypto::sign_chunk_contract(&signing_key, &chunk_id, &contract);
+
+        let priority = if r.priority >= 0 { r.priority } else { input.priority };
+        let expected_duration = if r.expected_duration_sec > 0 { r.expected_duration_sec } else { input.expected_duration_sec };
+        let lease_ttl = if r.lease_ttl_sec > 0 { r.lease_ttl_sec } else { input.lease_ttl_sec };
+
+        let is_canary = canary_answers.contains_key(&r.target_key);
+        let expected_result_hash = if is_canary {
+            Some(canary_answers[&r.target_key].clone())
+        } else {
+            None
+        };
+
+        records.push(OperatorSeedRecord {
+            chunk_id,
+            chunk_type: r.chunk_type,
+            target_key: r.target_key,
+            priority,
+            expected_duration_sec: expected_duration,
+            lease_ttl_sec: lease_ttl,
+            created_at: now_ms,
+            contract: signed_contract,
+            canary: is_canary,
+            expected_result_hash,
+        });
+    }
+
+    // Build canary rows for output
+    for rec in &records {
+        if rec.canary {
+            canary_rows.push((rec.chunk_id.clone(), rec.expected_result_hash.clone().unwrap_or_default(), now_ms));
+        }
+    }
+
+    // Always self-verify before anything else
+    let mut failed = Vec::new();
+    for rec in &records {
+        let sig_ok = verify_contract(&public_key_hex, &rec.chunk_id, &rec.contract);
+        if !sig_ok {
+            failed.push(rec.chunk_id.clone());
+        }
+    }
+    if !failed.is_empty() {
+        return Err(format!("self-verification FAILED for {} chunk(s) — nothing was inserted; investigate before retrying", failed.len()));
+    }
+
+    // Build manifest for output
+    let manifest = serde_json::json!({
+        "tool": "operator_seed (GUI)",
+        "generated_at_ms": now_ms,
+        "account": cf_account_id,
+        "db_id": cf_database_id,
+        "public_key_hex": public_key_hex,
+        "expires_days": input.expires_days,
+        "chunks": records.iter().map(|r| serde_json::json!({
+            "chunk_id": r.chunk_id,
+            "type": r.chunk_type.as_str(),
+            "target_key": r.target_key,
+            "priority": r.priority,
+            "expected_duration_sec": r.expected_duration_sec,
+            "lease_ttl_sec": r.lease_ttl_sec,
+            "created_at": r.created_at,
+            "status": "pending",
+            "contract": r.contract,
+            "canary": r.canary,
+            "expected_result_hash": r.expected_result_hash,
+        })).collect::<Vec<_>>()
+    });
+
+    if input.dry_run {
+        return Ok(OperatorSeedOutput {
+            manifest,
+            dry_run: true,
+            chunks_count: records.len(),
+            canaries_count: canary_rows.len(),
+        });
+    }
+
+    // Live insert: read CF bearer token
+    let bearer = settings::read_operator_cf_token(&st.data_dir)
+        .ok_or_else(|| "CF bearer token not stored — set it in Settings ▸ Operator and save".to_string())?;
+
+    // Insert into D1 (all-or-nothing: build all SQL first, then execute in one batch)
+    let d1_result = insert_into_d1(&bearer, cf_account_id, cf_database_id, &records, &canary_rows).await?;
+    if d1_result.chunks_inserted != records.len() {
+        return Err(format!("D1 read-back found {} of {} chunk rows — investigate", d1_result.chunks_inserted, records.len()));
+    }
+    if !canary_rows.is_empty() && d1_result.canaries_inserted != canary_rows.len() {
+        return Err(format!("D1 read-back found {} of {} canary rows", d1_result.canaries_inserted, canary_rows.len()));
+    }
+
+    Ok(OperatorSeedOutput {
+        manifest,
+        dry_run: false,
+        chunks_count: records.len(),
+        canaries_count: canary_rows.len(),
+    })
+}
+
+// --- Helpers for operator_seed ---
+
+#[derive(Debug, Clone)]
+struct ParsedTarget {
+    chunk_type: ChunkType,
+    target_key: String,
+    priority: i32,
+    expected_duration_sec: u32,
+    lease_ttl_sec: u32,
+    staging_upload_prefix: String,
+}
+
+fn parse_targets_csv(path: &str) -> Result<Vec<ParsedTarget>, String> {
+    use std::fs;
+    let text = fs::read_to_string(path).map_err(|e| format!("cannot read targets CSV: {e}"))?;
+    let mut rows = Vec::new();
+    // The header (if present) is the first non-comment line — the operator's
+    // seed files carry comment banners above it.
+    let mut header_seen = false;
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if !header_seen {
+            header_seen = true;
+            if line.starts_with("type,") || line.starts_with("type\t") {
+                continue; // header
+            }
+        }
+        let cols: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+        if cols.len() < 2 {
+            return Err(format!("line {}: need at least type,target_key", i + 1));
+        }
+        let chunk_type = ChunkType::parse(cols[0]).ok_or_else(|| format!("line {}: unknown type '{}'", i + 1, cols[0]))?;
+        let target_key = cols[1].to_string();
+        if target_key.is_empty() {
+            return Err(format!("line {}: empty target_key", i + 1));
+        }
+        let priority = cols.get(2).and_then(|s| s.parse::<i32>().ok()).unwrap_or(-1);
+        let expected_duration_sec = cols.get(3).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+        let lease_ttl_sec = cols.get(4).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+        let staging_upload_prefix = cols.get(5).map(|s| s.to_string()).unwrap_or_default();
+        rows.push(ParsedTarget {
+            chunk_type,
+            target_key,
+            priority,
+            expected_duration_sec,
+            lease_ttl_sec,
+            staging_upload_prefix,
+        });
+    }
+    if rows.is_empty() {
+        return Err("targets CSV contains no data rows".to_string());
+    }
+    Ok(rows)
+}
+
+fn parse_canary_answers_csv(path: &str) -> Result<HashMap<String, String>, String> {
+    use std::fs;
+    let text = fs::read_to_string(path).map_err(|e| format!("cannot read canary answers CSV: {e}"))?;
+    let mut answers = HashMap::new();
+    // Header (if present) = first non-comment line; seed files carry comment
+    // banners above it.
+    let mut header_seen = false;
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if !header_seen {
+            header_seen = true;
+            if line.starts_with("target_key,") || line.starts_with("target_key\t") {
+                continue; // header
+            }
+        }
+        let cols: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+        if cols.len() < 2 {
+            continue;
+        }
+        let key = cols[0].to_string();
+        let hash = cols[1].to_lowercase();
+        if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(format!("line {}: expected_result_hash must be 64 lowercase hex", i + 1));
+        }
+        answers.insert(key, hash);
+    }
+    Ok(answers)
+}
+
+#[derive(Debug, Clone)]
+struct OperatorSeedRecord {
+    chunk_id: String,
+    chunk_type: ChunkType,
+    target_key: String,
+    priority: i32,
+    expected_duration_sec: u32,
+    lease_ttl_sec: u32,
+    created_at: i64,
+    contract: SignedChunkContract,
+    canary: bool,
+    expected_result_hash: Option<String>,
+}
+
+#[derive(Debug)]
+struct D1InsertResult {
+    chunks_inserted: usize,
+    canaries_inserted: usize,
+}
+
+async fn insert_into_d1(
+    bearer: &str,
+    account: &str,
+    db_id: &str,
+    records: &[OperatorSeedRecord],
+    canary_rows: &[(String, String, i64)],
+) -> Result<D1InsertResult, String> {
+    use reqwest::Client;
+    use serde_json::json;
+
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("D1 client: {e}"))?;
+
+    // Chunks insert (batch all in one query call, like the Python script)
+    let chunks_sql = build_chunks_insert_sql(records);
+    let chunks_params = build_chunks_insert_params(records);
+    let chunks_body = json!({ "sql": chunks_sql, "params": chunks_params });
+    let chunks_url = format!("https://api.cloudflare.com/client/v4/accounts/{account}/d1/database/{db_id}/query");
+    let resp = client.post(&chunks_url)
+        .bearer_auth(bearer)
+        .json(&chunks_body)
+        .send()
+        .await
+        .map_err(|e| format!("D1 chunks insert failed: {e}"))?;
+    let resp_json: serde_json::Value = resp.json().await.map_err(|e| format!("D1 chunks response: {e}"))?;
+    if !resp_json.get("success").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return Err(format!("D1 chunks insert rejected: {}", resp_json.get("errors").map(|v| v.to_string()).unwrap_or_default()));
+    }
+
+    // Canaries insert (if any)
+    let mut canaries_inserted = 0;
+    if !canary_rows.is_empty() {
+        // Ensure canaries table exists
+        let ddl_body = json!({ "sql": "CREATE TABLE IF NOT EXISTS canaries (chunk_id TEXT PRIMARY KEY REFERENCES chunks(chunk_id), expected_result_hash TEXT NOT NULL, created_at INTEGER NOT NULL)" });
+        let ddl_resp = client.post(&chunks_url)
+            .bearer_auth(bearer)
+            .json(&ddl_body)
+            .send()
+            .await
+            .map_err(|e| format!("D1 canaries DDL failed: {e}"))?;
+        let ddl_json: serde_json::Value = ddl_resp.json().await.map_err(|e| format!("D1 DDL response: {e}"))?;
+        if !ddl_json.get("success").and_then(|v| v.as_bool()).unwrap_or(false) {
+            // DDL might fail if table exists, but that's ok — continue
+        }
+
+        let canaries_sql = build_canaries_insert_sql(canary_rows);
+        let canaries_params = build_canaries_insert_params(canary_rows);
+        let canaries_body = json!({ "sql": canaries_sql, "params": canaries_params });
+        let can_resp = client.post(&chunks_url)
+            .bearer_auth(bearer)
+            .json(&canaries_body)
+            .send()
+            .await
+            .map_err(|e| format!("D1 canaries insert failed: {e}"))?;
+        let can_json: serde_json::Value = can_resp.json().await.map_err(|e| format!("D1 canaries response: {e}"))?;
+        if !can_json.get("success").and_then(|v| v.as_bool()).unwrap_or(false) {
+            return Err(format!("D1 canaries insert rejected: {}", can_json.get("errors").map(|v| v.to_string()).unwrap_or_default()));
+        }
+        canaries_inserted = canary_rows.len();
+    }
+
+    // Read-back verification (all-or-nothing)
+    let chunk_ids: Vec<&str> = records.iter().map(|r| r.chunk_id.as_str()).collect();
+    let readback_sql = format!(
+        "SELECT chunk_id FROM chunks WHERE chunk_id IN ({})",
+        chunk_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ")
+    );
+    let readback_body = json!({ "sql": readback_sql, "params": chunk_ids });
+    let rb_resp = client.post(&chunks_url)
+        .bearer_auth(bearer)
+        .json(&readback_body)
+        .send()
+        .await
+        .map_err(|e| format!("D1 read-back failed: {e}"))?;
+    let rb_json: serde_json::Value = rb_resp.json().await.map_err(|e| format!("D1 read-back response: {e}"))?;
+    let chunks_inserted = rb_json
+        .get("result")
+        .and_then(|r| r.get(0))
+        .and_then(|r| r.get("results"))
+        .and_then(|r| r.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+
+    Ok(D1InsertResult { chunks_inserted, canaries_inserted })
+}
+
+fn build_chunks_insert_sql(records: &[OperatorSeedRecord]) -> String {
+    let values: Vec<String> = records.iter().map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, 'pending')".to_string()).collect();
+    format!(
+        "INSERT INTO chunks (chunk_id, type, target_key, contract_json, priority, expected_duration_sec, lease_ttl_sec, created_at, status) VALUES {}",
+        values.join(", ")
+    )
+}
+
+fn build_chunks_insert_params(records: &[OperatorSeedRecord]) -> Vec<serde_json::Value> {
+    use lh_contributor_client::crypto::canonical_json;
+    let mut params = Vec::new();
+    for r in records {
+        let contract_value = serde_json::to_value(&r.contract).expect("contract serializes");
+        params.push(serde_json::Value::String(r.chunk_id.clone()));
+        params.push(serde_json::Value::String(r.chunk_type.as_str().to_string()));
+        params.push(serde_json::Value::String(r.target_key.clone()));
+        params.push(serde_json::Value::String(canonical_json(&contract_value)));
+        params.push(serde_json::Value::Number(r.priority.into()));
+        params.push(serde_json::Value::Number((r.expected_duration_sec as i64).into()));
+        params.push(serde_json::Value::Number((r.lease_ttl_sec as i64).into()));
+        params.push(serde_json::Value::Number(r.created_at.into()));
+    }
+    params
+}
+
+fn build_canaries_insert_sql(rows: &[(String, String, i64)]) -> String {
+    let values: Vec<String> = rows.iter().map(|_| "(?, ?, ?)".to_string()).collect();
+    format!(
+        "INSERT INTO canaries (chunk_id, expected_result_hash, created_at) VALUES {}",
+        values.join(", ")
+    )
+}
+
+fn build_canaries_insert_params(rows: &[(String, String, i64)]) -> Vec<serde_json::Value> {
+    let mut params = Vec::new();
+    for (cid, hash, ts) in rows {
+        params.push(serde_json::Value::String(cid.clone()));
+        params.push(serde_json::Value::String(hash.clone()));
+        params.push(serde_json::Value::Number((*ts).into()));
+    }
+    params
 }
 
 #[tauri::command]
@@ -2371,6 +2904,14 @@ pub fn save_settings(
         settings::write_llm_key(&st.data_dir, Some(key))
             .map_err(|e| FieldError::new("llm_api_key", e))?;
     }
+    // Operator CF bearer token: same pattern as llm_api_key — own 0600 file,
+    // never settings.json, never echoed back.
+    if let Some(op) = &input.operator {
+        if let Some(key) = &op.cf_bearer_token {
+            settings::write_operator_cf_token(&st.data_dir, Some(key))
+                .map_err(|e| FieldError::new("operator_cf_token", e))?;
+        }
+    }
     // Launch-at-login intent changed: write the OS entry FIRST. If the OS
     // write fails the save aborts before settings.json is touched, so the
     // file can never advertise an autostart state the OS does not actually
@@ -2608,6 +3149,7 @@ mod tests {
             },
             schedule: ScheduleCfg::default(),
             local_model: settings::LocalModelCfg::default(),
+            operator: settings::OperatorCfg::default(),
             autostart: false,
         };
         let input = SettingsInput {
@@ -2628,6 +3170,7 @@ mod tests {
                 active_until: Some("06:00".to_string()),
             }),
             local_model: None,
+            operator: None,
             autostart: None,
             llm_api_key: None,
         };
@@ -2656,6 +3199,7 @@ mod tests {
             dry_run: None,
             schedule: None,
             local_model: None,
+            operator: None,
             autostart: None,
             llm_api_key: None,
         };
@@ -2673,6 +3217,7 @@ mod tests {
             capabilities: Capabilities::default(),
             schedule: ScheduleCfg::default(),
             local_model: settings::LocalModelCfg::default(),
+            operator: settings::OperatorCfg::default(),
             autostart: false,
         };
         let input_for = |model_id: &str| SettingsInput {
@@ -2691,6 +3236,7 @@ mod tests {
                 model_name: None,
                 ctx_tokens: None,
             }),
+            operator: None,
             llm_api_key: None,
             autostart: None,
         };
@@ -2730,6 +3276,7 @@ mod tests {
                 dry_run: None,
                 capabilities: None,
                 schedule: None,
+                operator: None,
                 llm_api_key: None,
                 autostart: None,
             },
@@ -2750,6 +3297,7 @@ mod tests {
             capabilities: Capabilities::default(),
             schedule: ScheduleCfg::default(),
             local_model: settings::LocalModelCfg::default(),
+            operator: settings::OperatorCfg::default(),
             autostart: true,
         };
         let input = |autostart: Option<bool>| SettingsInput {
@@ -2760,6 +3308,7 @@ mod tests {
             capabilities: None,
             schedule: None,
             local_model: None,
+            operator: None,
             autostart,
             llm_api_key: None,
         };
@@ -2882,6 +3431,7 @@ mod tests {
             // Mode None → the lifecycle under test is the pre-change path:
             // no llm declaration, no sidecar, `Config.llm = None`.
             local_model: settings::LocalModelCfg::default(),
+            operator: settings::OperatorCfg::default(),
             autostart: false,
         };
         let st = Arc::new(AppState::new(dir.clone(), settings, None));
@@ -2986,6 +3536,131 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Operator seeding: targets CSV parsing — header skip, comments, type
+    /// mapping, and optional-column defaults, mirroring caw-issue-chunks.py.
+    #[test]
+    fn parse_targets_csv_parses_sample_shape() {
+        let dir = std::env::temp_dir().join("lhc-gui-opseed-targets");
+        let _ = fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("targets.csv");
+        fs::write(
+            &path,
+            "# comment line\n\
+             type,target_key\n\
+             ingest,WI/55011\n\
+             alt_source,WI/55083\n\
+             state_walk,GA/13067,5,600,900\n",
+        )
+        .expect("write csv");
+
+        let rows = parse_targets_csv(path.to_str().unwrap()).expect("parse");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].chunk_type, ChunkType::Ingest);
+        assert_eq!(rows[0].target_key, "WI/55011");
+        assert_eq!(rows[0].priority, -1, "omitted priority defaults to -1");
+        assert_eq!(rows[2].chunk_type, ChunkType::StateWalk);
+        assert_eq!(rows[2].priority, 5);
+        assert_eq!(rows[2].expected_duration_sec, 600);
+        assert_eq!(rows[2].lease_ttl_sec, 900);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_targets_csv_rejects_unknown_type_and_empty_target() {
+        let dir = std::env::temp_dir().join("lhc-gui-opseed-targets-bad");
+        let _ = fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let bad_type = dir.join("bad-type.csv");
+        fs::write(&bad_type, "type,target_key\nflorbed,WI/55011\n").expect("write");
+        assert!(parse_targets_csv(bad_type.to_str().unwrap())
+            .unwrap_err()
+            .contains("unknown type"));
+        let empty_target = dir.join("empty-target.csv");
+        fs::write(&empty_target, "type,target_key\ningest,\n").expect("write");
+        assert!(parse_targets_csv(empty_target.to_str().unwrap())
+            .unwrap_err()
+            .contains("empty target_key"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Canary answers CSV: header/comment handling and the strict 64-hex
+    /// gate on expected_result_hash (a malformed hash must abort the whole
+    /// seed, never insert a partial batch).
+    #[test]
+    fn parse_canary_answers_csv_validates_hashes_strictly() {
+        let dir = std::env::temp_dir().join("lhc-gui-opseed-canary");
+        let _ = fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let good = dir.join("good.csv");
+        fs::write(
+            &good,
+            "# synthetic\n\
+             target_key,expected_result_hash\n\
+             WI/55011,1111111111111111111111111111111111111111111111111111111111111111\n\
+             GA/13067,2222222222222222222222222222222222222222222222222222222222222222\n",
+        )
+        .expect("write");
+        let answers = parse_canary_answers_csv(good.to_str().unwrap()).expect("parse");
+        assert_eq!(answers.len(), 2);
+        assert_eq!(
+            answers["WI/55011"],
+            "1111111111111111111111111111111111111111111111111111111111111111"
+        );
+
+        let bad = dir.join("bad.csv");
+        fs::write(
+            &bad,
+            "target_key,expected_result_hash\nWI/55011,zzzz\n",
+        )
+        .expect("write");
+        assert!(parse_canary_answers_csv(bad.to_str().unwrap())
+            .unwrap_err()
+            .contains("64 lowercase hex"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Contract build for a seeded chunk: signed via the part-1 core, and
+    /// the signature must pass the client verify path for the SAME key.
+    #[test]
+    fn seeded_contract_signs_and_verifies_under_client_rules() {
+        use lh_contributor_client::crypto::{
+            load_signing_key_pem, sign_chunk_contract, signing_key_public_hex, verify_contract,
+        };
+        use ed25519_dalek::pkcs8::EncodePrivateKey;
+
+        // Deterministic test key, built the same way the sdk tests build
+        // theirs, then round-tripped through a PKCS#8 PEM (the operator's
+        // on-disk format).
+        let key = {
+            use sha2::{Digest, Sha256};
+            let hash = Sha256::digest(*b"caw-opseed-contract-test-seed-0");
+            let bytes: [u8; 32] = hash.into();
+            ed25519_dalek::SigningKey::from_bytes(&bytes)
+        };
+        let der = key.to_pkcs8_der().expect("der");
+        let pem = pem::Pem::new("PRIVATE KEY", der.as_bytes()).to_string();
+        let signing = load_signing_key_pem(&pem).expect("load");
+
+        let contract = SignedChunkContract {
+            core: lh_contributor_client::api::ChunkContract {
+                chunk_type: ChunkType::Ingest,
+                target_key: "WI/55011".to_string(),
+                payload: serde_json::json!({"source_urls": ["https://example.gov/a"]}),
+                schema_version: 1,
+            },
+            expires_at: 1_799_999_999_999,
+            operator_signature_hex: String::new(),
+            staging_upload_prefix: "stage/raw/ingest/wi/55011/lease-1/".to_string(),
+        };
+        let signed = sign_chunk_contract(&signing, "seed-chunk-1", &contract);
+        assert!(verify_contract(
+            &signing_key_public_hex(&signing),
+            "seed-chunk-1",
+            &signed
+        ));
+    }
+
     #[test]
     fn merge_clears_the_stored_key_override_on_empty_string_only() {
         // RT2 F2: the only wire value that clears the stored override is
@@ -2999,6 +3674,7 @@ mod tests {
             capabilities: Capabilities::default(),
             schedule: ScheduleCfg::default(),
             local_model: settings::LocalModelCfg::default(),
+            operator: settings::OperatorCfg::default(),
             autostart: false,
         };
         let input = |key: Option<&str>| SettingsInput {
@@ -3009,6 +3685,7 @@ mod tests {
             capabilities: None,
             schedule: None,
             local_model: None,
+            operator: None,
             autostart: None,
             llm_api_key: None,
         };

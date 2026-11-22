@@ -236,6 +236,21 @@ impl ResourceCap {
     }
 }
 
+/// Operator issuance settings. The private key PATH is stored (key bytes
+/// never leave the operator's disk — read fresh per operation). The CF
+/// bearer token lives in its own 0600 `operator_cf_token.json` (same
+/// protection class as credentials.json / llm_api_key.json) and is only
+/// ever sent to the D1 REST endpoint.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct OperatorCfg {
+    #[serde(default)]
+    pub key_path: String,
+    #[serde(default)]
+    pub cf_account_id: String,
+    #[serde(default)]
+    pub cf_database_id: String,
+}
+
 /// The persisted Local Model settings. The API key is deliberately NOT a
 /// field: it lives in its own 0600 `llm_api_key.json` (same protection
 /// class as credentials.json) and is only ever sent to `endpoint`.
@@ -355,6 +370,8 @@ pub struct GuiSettings {
     pub schedule: ScheduleCfg,
     #[serde(default)]
     pub local_model: LocalModelCfg,
+    #[serde(default)]
+    pub operator: OperatorCfg,
     /// Launch-at-login INTENT (Settings checkbox → apply_autostart in
     /// contributor.rs). The OS entry the autostart plugin writes: an HKCU
     /// `Software\Microsoft\Windows\CurrentVersion\Run` value on Windows, a
@@ -435,6 +452,7 @@ impl GuiSettings {
             capabilities,
             schedule: ScheduleCfg::default(),
             local_model,
+            operator: OperatorCfg::default(),
             // Launch-at-login is deliberately NOT env-seedable: registering
             // a per-user OS login entry is a human action (the Settings
             // checkbox), same doctrine as Auto model mode being UI-only.
@@ -766,6 +784,51 @@ pub fn write_llm_key(dir: &Path, key: Option<&str>) -> Result<(), String> {
     }
 }
 
+/// Operator CF API bearer token (issuance) — separate 0600 credential file
+/// with the same protection class as credentials.json / llm_api_key.json.
+/// Never echoed into any settings view, never logged, and only ever sent
+/// to the Cloudflare D1 REST endpoint as a Bearer token.
+pub fn operator_cf_token_path(dir: &Path) -> std::path::PathBuf {
+    dir.join("operator_cf_token.json")
+}
+
+pub fn read_operator_cf_token(dir: &Path) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct KeyFile {
+        bearer_token: String,
+    }
+    fs::read_to_string(operator_cf_token_path(dir))
+        .ok()
+        .and_then(|t| serde_json::from_str::<KeyFile>(&t).ok())
+        .map(|k| k.bearer_token)
+        .filter(|k| !k.is_empty())
+}
+
+/// Some(non-empty) stores; Some("") removes; None is a no-op.
+pub fn write_operator_cf_token(dir: &Path, key: Option<&str>) -> Result<(), String> {
+    let path = operator_cf_token_path(dir);
+    match key.map(str::trim) {
+        None => Ok(()),
+        Some("") => {
+            if path.exists() {
+                fs::remove_file(&path).map_err(|e| format!("could not remove operator CF token file: {e}"))?;
+            }
+            Ok(())
+        }
+        Some(k) => {
+            fs::create_dir_all(dir).map_err(|e| format!("could not create app data dir: {e}"))?;
+            let json = serde_json::json!({ "bearer_token": k }).to_string();
+            fs::write(&path, json).map_err(|e| format!("could not write {}: {e}", path.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+            }
+            Ok(())
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Cross-session runtime total (runtime.json)
 // ---------------------------------------------------------------------------
@@ -848,6 +911,7 @@ mod tests {
                 model_name: "qwen3:8b".to_string(),
                 ctx_tokens: 8192,
             },
+            operator: OperatorCfg::default(),
             // true on purpose: the roundtrip must prove the intent survives
             // write → load, not just the off default.
             autostart: true,
@@ -998,6 +1062,7 @@ mod tests {
             capabilities: Capabilities::default(),
             schedule: ScheduleCfg::default(),
             local_model: LocalModelCfg::default(),
+            operator: OperatorCfg::default(),
             autostart: false,
         };
         assert!(base.clone().validate().is_ok());
@@ -1107,6 +1172,7 @@ mod tests {
             capabilities: Capabilities::default(),
             schedule: ScheduleCfg::default(),
             local_model: LocalModelCfg::default(),
+            operator: OperatorCfg::default(),
             autostart: false,
         };
 
@@ -1319,7 +1385,7 @@ mod tests {
         // merged settings still validate.
         fs::write(
             settings_path(&dir),
-            r#"{"coordinator_url":"https://example.test","public_key_hex":"","concurrency":2,"dry_run":true,"capabilities":{"examination":true,"ingest":true,"alt_source":true,"state_walk":true,"search":true,"classify":false},"schedule":{"enabled":false,"active_from":"09:00","active_until":"17:00"},"local_model":{"mode":"none","llama_server_bin":"bin/llama-server"},"autostart":false}"#,
+            r#"{"coordinator_url":"https://example.test","public_key_hex":"","concurrency":2,"dry_run":true,"capabilities":{"examination":true,"ingest":true,"alt_source":true,"state_walk":true,"search":true,"classify":false},"schedule":{"enabled":false,"active_from":"09:00","active_until":"17:00"},"local_model":{"mode":"none","llama_server_bin":"bin/llama-server"},"operator":{"key_path":"","cf_account_id":"","cf_database_id":""},"autostart":false}"#,
         )
         .expect("seed");
         let s = load_or_create(&dir).expect("load");
@@ -1355,6 +1421,7 @@ mod tests {
   "capabilities": {{"examination": true, "ingest": true, "alt_source": true, "state_walk": true, "search": true, "classify": false}},
   "schedule": {{"enabled": false, "active_from": "09:00", "active_until": "17:00"}},
   "local_model": {{"mode": "none", "llama_server_bin": "{}"}},
+  "operator": {{"key_path": "", "cf_account_id": "", "cf_database_id": ""}},
   "autostart": false
 }}"#,
                 good.display()
@@ -1391,6 +1458,7 @@ mod tests {
             capabilities: Capabilities::default(),
             schedule: ScheduleCfg::default(),
             local_model: LocalModelCfg::default(),
+            operator: OperatorCfg::default(),
             autostart: false,
         };
 
@@ -1452,6 +1520,7 @@ mod tests {
             capabilities: Capabilities::default(),
             schedule: ScheduleCfg::default(),
             local_model: LocalModelCfg::default(),
+            operator: OperatorCfg::default(),
             autostart: false,
         };
         let with_url = |url: &str| GuiSettings {
