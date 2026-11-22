@@ -36,20 +36,47 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Guard: fail fast (19s, no runners burned) when the tag and the version
-  # surfaces disagree. v0.1.1 shipped 0.1.0-labeled binaries and a v0.1.3
-  # tag was cut from 0.1.2-labeled sources — this job makes both impossible.
+  # Guard: fail fast (19s, no runners burned) when the publish target and
+  # the version surfaces disagree. v0.1.1 shipped 0.1.0-labeled binaries and
+  # a v0.1.3 tag was cut from 0.1.2-labeled sources — this job makes both
+  # impossible. RT2 F5 extended it to workflow_dispatch (a dispatch used to
+  # skip the guard entirely, and the publish step would create a release
+  # named after a branch or any typed string); RT2 F1 adds the pin check so
+  # a release can never ship the placeholder contract key.
   version-guard:
     runs-on: ubuntu-latest
-    # Tag pushes only — on workflow_dispatch REF_NAME is a branch name,
-    # and the publish step resolves the tag explicitly there.
-    if: startsWith(github.ref, 'refs/tags/')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Tag must match tauri.conf.json version
+      - name: Resolve the tag this run publishes under
+        env:
+          DISPATCH_TAG: ${{ inputs.tag_name }}
         run: |
           set -euo pipefail
-          TAG="${GITHUB_REF_NAME}"
+          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            # Dispatch: the publish step uses inputs.tag_name verbatim, so
+            # that value — not REF_NAME (a branch) — is what must be guarded.
+            if [ -z "$DISPATCH_TAG" ]; then
+              echo "::error::workflow_dispatch requires the tag_name input (vMAJOR.MINOR.PATCH, matching tauri.conf.json)"
+              exit 1
+            fi
+            echo "tag=$DISPATCH_TAG" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Tag must match tauri.conf.json version
+        env:
+          EXPECTED_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          TAG="$EXPECTED_TAG"
+          # A dispatch-built release has no tag object to lean on — the name
+          # is whatever was typed — so demand plain v-semver there (RT2 F5).
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "::error::dispatch tag_name '$TAG' is not vMAJOR.MINOR.PATCH — refusing to publish"
+              exit 1
+            fi
+          fi
           case "$TAG" in
             v*) VERSION="${TAG#v}" ;;
             *) echo "::error::tag $TAG does not start with v"; exit 1 ;;
@@ -60,12 +87,29 @@ jobs:
             exit 1
           fi
           echo "tag $TAG matches version $CONF_VERSION"
+      # RT2 F1: PUBLIC_KEY_HEX_DEFAULT starts life as a placeholder that
+      # release prep swaps BY HAND for the operator's ed25519 key (the value
+      # never travels through chat — see the settings.rs doc comment). A
+      # forgotten swap bricks every volunteer's Start with an error message
+      # that solicits pasting a key (a ready-made phishing template). This
+      # grep passes only when the constant holds a 64-hex key, exactly once.
+      - name: Pinned contract key must be swapped out of the placeholder
+        run: |
+          set -euo pipefail
+          FILE="gui/src-tauri/src/settings.rs"
+          COUNT="$(grep -cE '^pub const PUBLIC_KEY_HEX_DEFAULT: &str = "[0-9a-fA-F]{64}";$' "$FILE" || true)"
+          if [ "$COUNT" != "1" ]; then
+            echo "::error::PUBLIC_KEY_HEX_DEFAULT is not a 64-hex key (matches: $COUNT) — swap the placeholder for the operator's key before releasing (see settings.rs)"
+            exit 1
+          fi
+          echo "pinned contract key is 64-hex — placeholder swapped"
 
   build:
     needs: version-guard
-    # Proceed when the guard passed (tag push) or was skipped (dispatch);
-    # never proceed when it failed.
-    if: ${{ !cancelled() && (needs.version-guard.result == 'success' || needs.version-guard.result == 'skipped') }}
+    # Proceed only when the guard passed. The guard is unconditional now
+    # (RT2 F5), so 'skipped' is no longer a dispatch escape hatch; this
+    # never proceeds when it failed or the run was cancelled.
+    if: ${{ !cancelled() && needs.version-guard.result == 'success' }}
     strategy:
       fail-fast: false
       matrix:
@@ -127,6 +171,14 @@ jobs:
       - name: npm ci
         working-directory: gui
         run: npm ci
+
+      # RT2 F5: verify BEFORE stamping — a checkout whose package.json /
+      # Cargo.toml drifted from tauri.conf.json must fail the build instead
+      # of being silently fixed in-flight (the old order stamped first, so
+      # verify-version only ever checked that the stamp worked).
+      - name: Verify version surfaces are consistent (fail on drift)
+        working-directory: gui
+        run: npm run verify-version
 
       - name: Stamp the release version (tauri.conf.json is the source of truth)
         working-directory: gui

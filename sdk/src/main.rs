@@ -79,7 +79,7 @@ async fn cmd_register() -> Result<()> {
         ))
         .await
         .context("register failed")?;
-    let path = save_credentials(&cfg.work_dir, &creds)?;
+    let path = save_credentials(&cfg.work_dir, &cfg.coordinator_url, &creds)?;
     println!("registered client_id = {}", creds.client_id);
     println!("auth_token saved to {} (0600, not echoed)", path.display());
     Ok(())

@@ -19,7 +19,8 @@
 //!   primitive and is tracked as a follow-up; this card must not modify the
 //!   client lib.
 //! - Resume (or the primary button after pause/error) constructs a fresh
-//!   `Runner`; the client identity persists in `credentials.json`, so a
+//!   `Runner`; the client identity persists in the per-coordinator-host
+//!   credentials file (`credentials-<host>.json`, RT2 F3a), so a
 //!   resume reuses the registered warrior instead of re-registering
 //!   (proven by the fake-coordinator lifecycle test).
 //!
@@ -59,7 +60,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{Local, Timelike};
 use lh_contributor_client::api::{ApiClient, Credentials, LlmCapability, LlmEndpointKind};
-use lh_contributor_client::config::{save_credentials, Config, LlmConfig, StagingConfig};
+use lh_contributor_client::config::{
+    credentials_file_for, load_credentials_for, save_credentials, Config, LlmConfig, StagingConfig,
+};
 use lh_contributor_client::stats::SlotActivity;
 use lh_contributor_client::{register_request, register_request_with_llm, RunOptions, Runner, StatsHandle};
 use serde::{Deserialize, Serialize};
@@ -241,14 +244,28 @@ impl AppState {
         guard(&self.settings).clone()
     }
 
+    /// Credentials file bound to the CURRENTLY configured coordinator
+    /// (RT2 F3a): the auth token only ever lives next to the host that
+    /// minted it, so a coordinator URL change lands on a fresh file and
+    /// the next Start/Register re-registers instead of replaying the old
+    /// tracker's token.
     fn creds_path(&self) -> PathBuf {
+        let url = self.settings_snapshot().coordinator_url;
+        credentials_file_for(&self.data_dir, &url)
+    }
+
+    /// Pre-per-host single credentials file (v0.1.x). Adopted read-only for
+    /// the historical default URL (the SDK's load rule); Unregister is the
+    /// only path that deletes it.
+    fn legacy_creds_path(&self) -> PathBuf {
         self.data_dir.join("credentials.json")
     }
 
     fn credentials(&self) -> Option<Credentials> {
-        std::fs::read_to_string(self.creds_path())
+        let url = self.settings_snapshot().coordinator_url;
+        load_credentials_for(&self.data_dir, &url)
             .ok()
-            .and_then(|t| serde_json::from_str::<Credentials>(&t).ok())
+            .flatten()
     }
 
     fn api_client(&self) -> Result<ApiClient, String> {
@@ -300,14 +317,23 @@ impl AppState {
         ) {
             return Err("pause the contributor loop before unregistering".to_string());
         }
-        let path = self.creds_path();
-        if !path.exists() {
+        // Remove the per-host file for the current coordinator AND the
+        // legacy single file (RT2 F3a migration keeps legacy data until
+        // this exact call; Unregister remains the only deleter).
+        let mut removed = Vec::new();
+        for path in [self.creds_path(), self.legacy_creds_path()] {
+            if path.exists() {
+                std::fs::remove_file(&path)
+                    .map_err(|e| format!("could not remove {}: {e}", path.display()))?;
+                removed.push(path.display().to_string());
+            }
+        }
+        if removed.is_empty() {
             return Ok("no local credentials file to remove — this client was never registered here".to_string());
         }
-        std::fs::remove_file(&path).map_err(|e| format!("could not remove {}: {e}", path.display()))?;
         Ok(format!(
             "identity removed locally (deleted {}) — the coordinator has no revoke endpoint, so this client simply stops acting: any open leases lapse and requeue for other volunteers.",
-            path.display()
+            removed.join(" and ")
         ))
     }
 
@@ -754,6 +780,17 @@ impl AppState {
 
     fn build_config(&self, llm_cfg: Option<LlmConfig>) -> Result<(Config, bool), String> {
         let s = self.settings_snapshot();
+        // RT2 F3: the coordinator receives the identity token and every
+        // work result — plain HTTP is loopback/localhost-only. This mirrors
+        // GuiSettings::validate so a hand-edited settings.json is not a
+        // bypass around the Settings dialog check.
+        let url = s.coordinator_url.trim();
+        if url.starts_with("http://") && !crate::sidecar::is_loopback_url(url) {
+            return Err(
+                "coordinator URL must be https:// (plain http is only allowed for 127.0.0.1/localhost)"
+                    .to_string(),
+            );
+        }
         let key = s.resolved_public_key();
         if key.len() != 64 || !key.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err(
@@ -762,9 +799,20 @@ impl AppState {
                     .to_string(),
             );
         }
+        // RT2 F2: carry the pin ONLY when a stored override is in play —
+        // that is the one configuration whose contract-verification failure
+        // should point at Settings (clear the override) instead of the env
+        // var. A blank stored field resolves straight to the pin (or env),
+        // and the generic hint stays accurate there.
+        let stored_key = s.public_key_hex.trim();
         let cfg = Config {
             coordinator_url: s.coordinator_url.clone(),
             public_key_hex: key,
+            pinned_public_key_hex: if stored_key.is_empty() {
+                None
+            } else {
+                Some(settings::PUBLIC_KEY_HEX_DEFAULT.to_string())
+            },
             credentials: self.credentials(),
             concurrency: s.concurrency,
             work_dir: self.data_dir.clone(),
@@ -1694,7 +1742,18 @@ fn settings_view(st: &AppState) -> SettingsView {
     // and using it here would mislabel a blank field as an existing entry.
     // The run loop's build_config keeps resolving the full chain.
     let stored_key = s.public_key_hex.trim().to_string();
-    let creds_present = st.creds_path().exists();
+    // RT2 F3a: presence is what Start would actually load (per-host file,
+    // or the legacy fallback when the URL is the historical default); the
+    // displayed path names whichever file currently backs that identity,
+    // else the per-host path a future register will write.
+    let per_host = st.creds_path();
+    let legacy = st.legacy_creds_path();
+    let creds_present = st.credentials().is_some();
+    let credentials_path = if per_host.exists() || !legacy.exists() {
+        per_host
+    } else {
+        legacy
+    };
     let staging_mode = AppState::staging_mode(&s);
     SettingsView {
         coordinator_url: s.coordinator_url,
@@ -1711,7 +1770,7 @@ fn settings_view(st: &AppState) -> SettingsView {
             String::new()
         },
         data_dir: st.data_dir.display().to_string(),
-        credentials_path: st.creds_path().display().to_string(),
+        credentials_path: credentials_path.display().to_string(),
         credentials_present: creds_present,
         client_id: st.credentials().map(|c| c.client_id),
         local_model: s.local_model.clone(),
@@ -1805,7 +1864,9 @@ pub fn get_status(app: AppHandle) -> UiStatus {
         schedule_in_window: st.in_window_now(),
         total_runtime_secs: st.runtime_total.load(Ordering::Relaxed) + live_tail_secs,
         staging: AppState::staging_mode(&settings),
-        credentials_present: st.creds_path().exists(),
+        // Adoption-aware (RT2 F3a): the identity the run loop would use,
+        // not merely whether one particular file exists.
+        credentials_present: st.credentials().is_some(),
         client_id: st.credentials().map(|c| c.client_id),
         stats,
         slots,
@@ -1881,8 +1942,12 @@ pub async fn register_client(app: AppHandle) -> Result<String, String> {
             .await
             .map_err(|e| format!("register failed: {e}"))?
     };
-    let path = save_credentials(&st.data_dir, &creds)
-        .map_err(|e| format!("could not persist credentials: {e}"))?;
+    let path = save_credentials(
+        &st.data_dir,
+        &st.settings_snapshot().coordinator_url,
+        &creds,
+    )
+    .map_err(|e| format!("could not persist credentials: {e}"))?;
     *guard(&st.last_error) = None;
     if st.phase() == Phase::Error {
         st.set_phase(Phase::Idle);
@@ -1914,6 +1979,14 @@ pub async fn check_coordinator(app: AppHandle, url: Option<String>) -> Result<St
             }
             url::Url::parse(draft_url)
                 .map_err(|_| "coordinator URL is not a valid URL".to_string())?;
+            // Same plain-HTTP rule as save: the probe itself sends nothing
+            // but /health, yet accepting here would bless a URL the save
+            // rejects (RT2 F3).
+            if draft_url.starts_with("http://") && !sidecar::is_loopback_url(draft_url) {
+                return Err(
+                    "non-HTTPS coordinator URLs are only allowed for loopback/localhost (127.0.0.1, [::1], localhost)".to_string(),
+                );
+            }
             ApiClient::new(draft_url, Duration::from_secs(10))
                 .map_err(|e| format!("bad coordinator URL: {e}"))?
         }
@@ -2797,7 +2870,7 @@ mod tests {
             }
             assert!(lease_hits() >= 3, "three slots should each lease-poll, got {}", lease_hits());
             assert_eq!(register_hits(), 1, "auto-register exactly once");
-            assert!(dir.join("credentials.json").exists(), "register persists credentials");
+            assert!(st.creds_path().exists(), "register persists credentials (per-host file)");
             let body = fake.last_lease_body.lock().expect("body").clone();
             assert!(
                 body.contains(r#""capabilities":["ingest","search"]"#),
@@ -2854,8 +2927,8 @@ mod tests {
             let msg = st.unregister_identity().expect("unregister");
             assert!(msg.contains("identity removed locally"));
             assert!(
-                !dir.join("credentials.json").exists(),
-                "unregister must delete the local credentials file"
+                !st.creds_path().exists(),
+                "unregister must delete the local credentials file (per-host)"
             );
         });
         let _ = fs::remove_dir_all(&dir);
@@ -2882,6 +2955,103 @@ mod tests {
         let msg = st.unregister_identity().expect("unregister");
         assert!(msg.contains("identity removed locally"));
         assert!(!st.creds_path().exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_clears_the_stored_key_override_on_empty_string_only() {
+        // RT2 F2: the only wire value that clears the stored override is
+        // Some("") (the Remove-stored-key button); None keeps it and a
+        // non-empty value replaces it.
+        let base = GuiSettings {
+            coordinator_url: "https://coordinator.test".to_string(),
+            public_key_hex: "ab".repeat(32),
+            concurrency: 2,
+            dry_run: true,
+            capabilities: Capabilities::default(),
+            schedule: ScheduleCfg::default(),
+            local_model: settings::LocalModelCfg::default(),
+            autostart: false,
+        };
+        let input = |key: Option<&str>| SettingsInput {
+            coordinator_url: None,
+            public_key_hex: key.map(|s| s.to_string()),
+            concurrency: None,
+            dry_run: None,
+            capabilities: None,
+            schedule: None,
+            local_model: None,
+            autostart: None,
+            llm_api_key: None,
+        };
+
+        // None (untouched field): the stored override survives.
+        assert_eq!(
+            merge_settings(&base, &input(None)).public_key_hex,
+            "ab".repeat(32),
+            "absent keeps the stored override"
+        );
+        // Some(""): cleared — the merged settings still validate, and the
+        // stored field is empty so the effective key falls through the
+        // chain (env → pin; that resolution is covered under its env lock
+        // by settings.rs's resolved_public_key test).
+        let cleared = merge_settings(&base, &input(Some("")));
+        assert_eq!(cleared.public_key_hex, "", "empty string clears the override");
+        assert!(cleared.validate().is_ok());
+        // Some(<64 hex>): replaces.
+        assert_eq!(
+            merge_settings(&base, &input(Some("cd".repeat(32).as_str()))).public_key_hex,
+            "cd".repeat(32)
+        );
+    }
+
+    #[test]
+    fn credentials_are_bound_to_the_configured_coordinator_host() {
+        // RT2 F3a GUI wiring: identity lives per host; the legacy single
+        // file is adopted only for the historical default URL and never
+        // travels anywhere else; Unregister removes whatever is on disk.
+        let dir = std::env::temp_dir().join("lhc-gui-per-host-creds-test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("credentials.json"),
+            r#"{"client_id":"legacy-c","auth_token":"legacy-t"}"#,
+        )
+        .expect("seed legacy creds");
+
+        // Default URL: the legacy identity is adopted (Start would reuse it).
+        let default_st = Arc::new(AppState::new(
+            dir.clone(),
+            GuiSettings::defaults_from_env(),
+            None,
+        ));
+        assert!(default_st.settings_snapshot().coordinator_url == crate::settings::DEFAULT_COORDINATOR);
+        assert_eq!(
+            default_st.credentials().as_ref().map(|c| c.client_id.as_str()),
+            Some("legacy-c"),
+            "legacy file adopted for the default coordinator"
+        );
+        assert!(default_st.legacy_creds_path().exists(), "adoption must not delete legacy data");
+
+        // A different coordinator: NOTHING loads for it — no replay of the
+        // old tracker's token, and the legacy file stays untouched.
+        let mut other_settings = GuiSettings::defaults_from_env();
+        other_settings.coordinator_url = "https://other-tracker.test".to_string();
+        let other_st = Arc::new(AppState::new(dir.clone(), other_settings, None));
+        assert!(other_st.credentials().is_none(), "foreign host must not adopt the legacy identity");
+        assert!(dir.join("credentials.json").exists());
+
+        // Registering on the new host would write ITS per-host file; both
+        // files then vanish together on unregister.
+        fs::write(
+            other_st.creds_path(),
+            r#"{"client_id":"new-c","auth_token":"new-t"}"#,
+        )
+        .expect("seed per-host creds");
+        let msg = other_st.unregister_identity().expect("unregister");
+        assert!(msg.contains("identity removed locally"));
+        assert!(!other_st.creds_path().exists());
+        assert!(!other_st.legacy_creds_path().exists(), "unregister remains the legacy deleter");
         let _ = fs::remove_dir_all(&dir);
     }
 

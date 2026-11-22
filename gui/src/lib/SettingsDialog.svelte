@@ -118,7 +118,13 @@
 		const key = draft.public_key_hex.trim();
 		const input = {
 			coordinator_url: draft.coordinator_url,
-			public_key_hex: /** @type {string | undefined} */ (key === '' ? undefined : key),
+			// Key handling mirrors the LLM key: sent ONLY when a new key was
+			// typed (replace), Remove stored key was pressed ('' clears the
+			// stored override — the built-in pinned key takes over), or the
+			// field is untouched (omitted entirely).
+			public_key_hex: /** @type {string | undefined} */ (
+				removeStoredKey ? '' : key === '' ? undefined : key
+			),
 			concurrency: Number(draft.concurrency),
 			dry_run: draft.dry_run,
 			capabilities: {
@@ -155,6 +161,7 @@
 				llm_api_key: ''
 			};
 			removeLlmKey = false;
+			removeStoredKey = false;
 			note = 'Settings saved. Concurrency, capabilities and dry-run apply on the next start; the run window, the launch-at-login entry and the local-model lane are reconciled immediately (a live sidecar restarts with the new caps when needed).';
 			await onChanged?.();
 		} catch (e) {
@@ -240,6 +247,10 @@
 	const llm = $derived(status?.llm ?? view?.llm ?? null);
 	const lmMode = $derived(draft.local_model.mode);
 	let removeLlmKey = $state(false);
+	// RT2 F2: the stored contract-key override (a v0.1.0–0.1.3 paste that
+	// silently beats the app's pinned key forever) must be clearable from
+	// the UI — same arm-then-save pattern as the LLM key's Remove button.
+	let removeStoredKey = $state(false);
 
 	const CAP_HINTS = /** @type {Record<string, string>} */ ({
 		gpu: 'Offload every layer the GPU can take (--n-gpu-layers 999). No GPU? llama-server falls back to CPU — this cap never hard-fails.',
@@ -549,6 +560,13 @@
 					placeholder={view?.public_key_configured ? `unchanged (…${view.public_key_tail})` : 'advanced — pre-filled automatically; leave blank unless your operator told you otherwise'}
 					autocomplete="off"
 				/>
+				{#if removeStoredKey}
+					<p class="fine lm-detail">The stored key override will be cleared when you save — the app falls back to its built-in pinned key.</p>
+				{:else if view?.public_key_configured}
+					<!-- RT2 F2: a stored override silently beats the pinned key on
+					     every rotation, so it must be clearable from here. -->
+					<button class="danger" onclick={() => (removeStoredKey = true)} disabled={busy}>Remove stored key</button>
+				{/if}
 				{#if errors.public_key_hex}
 					<p class="field-error" role="alert">{errors.public_key_hex}</p>
 				{/if}

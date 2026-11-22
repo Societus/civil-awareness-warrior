@@ -177,7 +177,7 @@ impl Runner {
                     .register(&register_req)
                     .await
                     .context("register failed")?;
-                let path = save_credentials(&cfg.work_dir, &c)?;
+                let path = save_credentials(&cfg.work_dir, &cfg.coordinator_url, &c)?;
                 tracing::info!(client_id = %c.client_id, path = %path.display(), "registered");
                 c
             }
@@ -406,7 +406,7 @@ async fn lease_round(
                 ))
                 .await
                 .context("emergency re-register failed")?;
-            let path = save_credentials(&state.cfg.work_dir, &creds)?;
+            let path = save_credentials(&state.cfg.work_dir, &state.cfg.coordinator_url, &creds)?;
             tracing::info!(client_id = %creds.client_id, path = %path.display(), "re-registered");
             *state.creds.write().expect("creds lock") = creds;
             return Ok(false);
@@ -452,7 +452,13 @@ async fn lease_round(
         )
         .await;
         if n >= 3 {
-            bail!("contract verification failed {n} times consecutively; check LH_PUBLIC_KEY_HEX or suspect tampering — aborting");
+            bail!(
+                "contract verification failed {n} times consecutively; {} — aborting",
+                verify_failure_hint(
+                    state.cfg.pinned_public_key_hex.as_deref(),
+                    &state.cfg.public_key_hex
+                )
+            );
         }
         return Ok(true);
     }
@@ -620,6 +626,22 @@ async fn lease_round(
     }
 }
 
+/// RT2 F2: a stored key override that no longer matches the app's pin is
+/// the one failure mode where "check LH_PUBLIC_KEY_HEX" is actively wrong
+/// advice — the stored Settings key wins the resolution chain and survives
+/// every app update, so three consecutive verification failures mean the
+/// volunteer's own stale override is the prime suspect. The embedder sets
+/// `Config.pinned_public_key_hex` (and only when a stored override is in
+/// play); without it the generic env-var hint stays.
+fn verify_failure_hint(pinned: Option<&str>, effective: &str) -> &'static str {
+    match pinned {
+        Some(pin) if pin != effective => {
+            "your stored advanced key differs from the app's pinned key — clear it under Settings"
+        }
+        _ => "check LH_PUBLIC_KEY_HEX or suspect tampering",
+    }
+}
+
 async fn report(state: &Arc<RunState>, lease_id: &str, failure_type: FailureType, details: &str) {
     let (client_id, auth_token) = {
         let creds = state.creds.read().expect("creds lock");
@@ -674,6 +696,7 @@ mod tests {
         Config {
             coordinator_url: "http://coordinator.invalid".to_string(),
             public_key_hex: "ab".repeat(32),
+            pinned_public_key_hex: None,
             credentials: None,
             concurrency: 2,
             work_dir: PathBuf::from("/tmp/lh-runner-test"),
@@ -683,6 +706,26 @@ mod tests {
             http_timeout_secs: 60,
             llm: None,
         }
+    }
+
+    #[test]
+    fn verify_failure_hint_names_the_stored_override_only_on_divergence() {
+        let pin = "ab".repeat(32);
+        assert_eq!(
+            verify_failure_hint(Some(&pin), &pin),
+            "check LH_PUBLIC_KEY_HEX or suspect tampering",
+            "stored key matches the pin — the generic hint stays accurate"
+        );
+        assert_eq!(
+            verify_failure_hint(Some(&pin), &"cd".repeat(32)),
+            "your stored advanced key differs from the app's pinned key — clear it under Settings",
+            "stale stored override is the RT2 F2 bricking shape"
+        );
+        assert_eq!(
+            verify_failure_hint(None, &"cd".repeat(32)),
+            "check LH_PUBLIC_KEY_HEX or suspect tampering",
+            "no pin known (CLI / env config) — generic hint"
+        );
     }
 
     #[test]

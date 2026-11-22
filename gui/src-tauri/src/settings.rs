@@ -496,6 +496,17 @@ impl GuiSettings {
                 "coordinator URL must start with http:// or https://",
             ));
         }
+        // RT2 F3: this host receives the volunteer's identity token and
+        // every work result. Plain HTTP is allowed only for loopback /
+        // localhost (dev trackers on this machine); any other host must be
+        // HTTPS or the save is rejected (build_config re-checks so a
+        // hand-edited settings.json is not a bypass).
+        if url.starts_with("http://") && !crate::sidecar::is_loopback_url(url) {
+            return Err(FieldError::new(
+                "coordinator_url",
+                "non-HTTPS coordinator URLs are only allowed for loopback/localhost (127.0.0.1, [::1], localhost) — a plain-HTTP tracker would receive your identity token and results in the clear",
+            ));
+        }
         let key = self.public_key_hex.trim();
         if !key.is_empty() && (key.len() != 64 || !key.chars().all(|c| c.is_ascii_hexdigit())) {
             return Err(FieldError::new(
@@ -1417,6 +1428,53 @@ mod tests {
             settings_with_key(&stored).resolved_public_key(),
             stored,
             "stored value wins over both fallbacks"
+        );
+    }
+
+    #[test]
+    fn default_coordinator_matches_the_sdk_legacy_credentials_url() {
+        // RT2 F3a: the SDK adopts a legacy single credentials.json ONLY for
+        // the historical default URL — these two constants must stay the
+        // same origin or the v0.1.x fleet loses its identity on upgrade.
+        assert_eq!(
+            DEFAULT_COORDINATOR,
+            lh_contributor_client::config::LEGACY_DEFAULT_COORDINATOR
+        );
+    }
+
+    #[test]
+    fn coordinator_url_plain_http_is_loopback_only() {
+        let base = GuiSettings {
+            coordinator_url: String::new(),
+            public_key_hex: String::new(),
+            concurrency: 2,
+            dry_run: true,
+            capabilities: Capabilities::default(),
+            schedule: ScheduleCfg::default(),
+            local_model: LocalModelCfg::default(),
+            autostart: false,
+        };
+        let with_url = |url: &str| GuiSettings {
+            coordinator_url: url.to_string(),
+            ..base.clone()
+        };
+
+        // https: always fine, loopback http: fine (dev trackers).
+        assert!(with_url("https://caw.landhunter.app").validate().is_ok());
+        assert!(with_url("http://127.0.0.1:8787").validate().is_ok());
+        assert!(with_url("http://localhost:9000").validate().is_ok());
+
+        // Any other host over plain HTTP: rejected at the coordinator field.
+        let err = with_url("http://mirror.example.org")
+            .validate()
+            .unwrap_err();
+        assert_eq!(err.field, "coordinator_url");
+        assert!(err.message.contains("loopback"), "{}", err.message);
+
+        // A LAN address is not loopback either.
+        assert_eq!(
+            with_url("http://192.168.1.20:8787").validate().unwrap_err().field,
+            "coordinator_url"
         );
     }
 }
