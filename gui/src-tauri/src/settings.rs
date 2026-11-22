@@ -27,7 +27,7 @@ pub const DEFAULT_COORDINATOR: &str = "https://caw.landhunter.app";
 /// empty-Settings path. Resolution order lives in
 /// `GuiSettings::resolved_public_key`: stored Settings value →
 /// LH_PUBLIC_KEY_HEX env → this const.
-pub const PUBLIC_KEY_HEX_DEFAULT: &str = "REPLACE_ME_BEFORE_RELEASE_64_HEX";
+pub const PUBLIC_KEY_HEX_DEFAULT: &str = "387234c3c5f7c59526eb68fb7ccb74a11894bd00def0294c4d14c3584f93596d";
 
 /// Validation failure tied to a settings field. Serialized into the webview
 /// rejection so the dialog can render the message under the exact control
