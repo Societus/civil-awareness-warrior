@@ -146,6 +146,7 @@ fn main() {
             contributor::register_client,
             contributor::unregister_identity,
             contributor::check_coordinator,
+            contributor::operator_key_info,
             contributor::get_settings_view,
             contributor::save_settings,
             contributor::community_stats,

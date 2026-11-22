@@ -29,7 +29,7 @@
 use crate::api::{LeaseResponse, SignedChunkContract};
 use crate::error::LeaseVerifyError;
 use crate::staging::validate_blob_key;
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde_json::Value;
 
 /// Parse the operator public key from its 64-char lowercase/uppercase hex
@@ -168,6 +168,56 @@ pub fn verify_contract(
     let sig = Signature::from_bytes(&sig_arr);
     let payload = build_contract_payload(chunk_id, contract);
     key.verify(&payload, &sig).is_ok()
+}
+
+// ---------------------------------------------------------------------------
+// Operator-side signing (issuance): the mirror image of the verify path
+// above. The private key lives only in the operator's settings as a PATH;
+// key bytes are read fresh per operation and never logged or persisted.
+// ---------------------------------------------------------------------------
+
+/// Load an openssl-generated ed25519 private key from PKCS#8 PEM text
+/// (`-----BEGIN PRIVATE KEY-----`). Accepts surrounding whitespace; rejects
+/// anything that is not exactly one parseable ed25519 private key.
+pub fn load_signing_key_pem(pem_text: &str) -> Result<SigningKey, String> {
+    use ed25519_dalek::pkcs8::DecodePrivateKey;
+
+    let trimmed = pem_text.trim();
+    if trimmed.is_empty() {
+        return Err("key file is empty".to_string());
+    }
+    let block = pem::parse(trimmed).map_err(|e| format!("not a PEM file: {e}"))?;
+    if block.tag() != "PRIVATE KEY" {
+        return Err(format!(
+            "not a PKCS#8 private key (found -----BEGIN {}-----; openssl-generated ed25519 \
+             keys carry the PRIVATE KEY tag, OpenSSH-format keys do not)",
+            block.tag()
+        ));
+    }
+    SigningKey::from_pkcs8_der(block.contents())
+        .map_err(|e| format!("unreadable ed25519 private key: {e}"))
+}
+
+/// 64-char lowercase hex public half of a signing key — what the operator
+/// compares against the Worker's PUBLIC_KEY_HEX secret and the app's pin.
+#[must_use]
+pub fn signing_key_public_hex(key: &SigningKey) -> String {
+    hex::encode(key.verifying_key().to_bytes())
+}
+
+/// Sign a chunk contract the way the tracker's auth.ts verifies it: ed25519
+/// over `{chunk_id}:{canonical_core_json}:{expires_at}`. Returns a copy of
+/// `contract` with `operator_signature_hex` filled in.
+#[must_use]
+pub fn sign_chunk_contract(
+    key: &SigningKey,
+    chunk_id: &str,
+    contract: &SignedChunkContract,
+) -> SignedChunkContract {
+    let payload = build_contract_payload(chunk_id, contract);
+    let mut signed = contract.clone();
+    signed.operator_signature_hex = hex::encode(key.sign(&payload).to_bytes());
+    signed
 }
 
 /// Full client-side gate before executing anything:
@@ -330,6 +380,71 @@ mod tests {
         assert_eq!(
             hex::encode(Sha256::digest(&payload)),
             "1a89be82759024c001adbbd56d0d74570436c35ef29b6b2c6d78e1134eab252a"
+        );
+    }
+
+    /// Operator issuance path: a PKCS#8 PEM (openssl-shaped) loads, its
+    /// public half matches, and its signature passes verify_contract.
+    #[test]
+    fn pkcs8_pem_load_and_sign_verify_roundtrip() {
+        use ed25519_dalek::pkcs8::EncodePrivateKey;
+
+        let key = signing_key_from_seed(*b"operator-issuance-test-seed-0032");
+        let der = key.to_pkcs8_der().expect("encode pkcs8 der");
+        let pem_text = pem::Pem::new("PRIVATE KEY", der.as_bytes()).to_string();
+        let loaded = load_signing_key_pem(&pem_text).expect("load pem");
+
+        // The loaded key is the SAME key: same public half.
+        assert_eq!(
+            signing_key_public_hex(&loaded),
+            signing_key_public_hex(&key)
+        );
+
+        // Its signature over the real payload verifies via the client path.
+        let contract = fixture_contract(1_799_999_999_999);
+        let chunk_id = "0f0e6d3a-1111-4222-8333-444455556666";
+        let signed = sign_chunk_contract(&loaded, chunk_id, &contract);
+        assert!(!signed.operator_signature_hex.is_empty());
+        let pub_hex = signing_key_public_hex(&loaded);
+        assert!(verify_contract(&pub_hex, chunk_id, &signed));
+        assert!(!verify_contract(&pub_hex, "other-chunk", &signed));
+    }
+
+    /// Garbage and wrong-format keys are rejected with a helpful error,
+    /// never a panic.
+    #[test]
+    fn pem_loader_rejects_garbage_and_wrong_formats() {
+        assert!(load_signing_key_pem("").is_err());
+        assert!(load_signing_key_pem("   \n  ").is_err());
+        assert!(load_signing_key_pem("not a key at all").is_err());
+        // Well-formed PEM armoring under the wrong tag names the expectation.
+        let openssh = "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----";
+        let err = load_signing_key_pem(openssh).unwrap_err();
+        assert!(err.contains("PKCS#8"), "error should name the expected format: {err}");
+    }
+
+    /// Canonical-JSON byte-match against the operator seeding tool
+    /// (`caw-issue-chunks.py --compute-fingerprint`): the consensus manifest
+    /// canonicalization must produce the identical sha256, or honest clients
+    /// would fail canary verification and get shadowed.
+    #[test]
+    fn canonical_json_matches_consensus_fingerprint_vector() {
+        use sha2::{Digest, Sha256};
+        let manifest = serde_json::json!({
+            "type": "ingest",
+            "target": "WI/55011",
+            "source_urls": ["https://example.gov/a", "https://example.gov/b"],
+            "page_count": 2,
+            "page_sha256": [
+                hex::encode(Sha256::digest(b"page-one-bytes")),
+                hex::encode(Sha256::digest(b"page-two-bytes")),
+            ],
+            "reconciliation": null,
+        });
+        assert_eq!(
+            hex::encode(Sha256::digest(canonical_json(&manifest).as_bytes())),
+            "9cdc3bc49204f2e1227781dfab32d846be7f85b86df47a33181b5df3e6973d7e",
+            "canonicalization drift vs the Python seeding tool — honest clients WILL be shadowed"
         );
     }
 

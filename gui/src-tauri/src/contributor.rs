@@ -1881,6 +1881,34 @@ pub async fn start_contributor(app: AppHandle) -> Result<(), String> {
     begin_run(app.state::<Arc<AppState>>().inner()).await
 }
 
+/// Operator issuance, step 1 of the seeding flow: load the private key at
+/// `key_path` and return ONLY its public half (64-hex), for the operator to
+/// eyeball against the Worker's PUBLIC_KEY_HEX secret and the app pin.
+/// Key bytes are read fresh per call and never leave this function.
+#[derive(serde::Serialize)]
+pub struct OperatorKeyInfo {
+    pub public_key_hex: String,
+}
+
+#[tauri::command]
+pub async fn operator_key_info(key_path: String) -> Result<OperatorKeyInfo, String> {
+    let path = std::path::PathBuf::from(&key_path);
+    if !path.is_file() {
+        return Err(format!("no key file at {key_path}"));
+    }
+    // Blocking file IO inside an async command: keep it off the UI thread.
+    tauri::async_runtime::spawn_blocking(move || {
+        let pem = std::fs::read_to_string(&path)
+            .map_err(|e| format!("cannot read key file: {e}"))?;
+        let key = lh_contributor_client::crypto::load_signing_key_pem(&pem)?;
+        Ok(OperatorKeyInfo {
+            public_key_hex: lh_contributor_client::crypto::signing_key_public_hex(&key),
+        })
+    })
+    .await
+    .map_err(|e| format!("key load task failed: {e}"))?
+}
+
 #[tauri::command]
 pub fn pause_contributor(app: AppHandle) -> Result<(), String> {
     app.state::<Arc<AppState>>().pause_user()
