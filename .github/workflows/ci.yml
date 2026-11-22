@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  lint:
+    name: Lint workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download actionlint binary
+        run: |
+          curl -sL -o /tmp/actionlint.tar.gz "https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz"
+          sha256sum /tmp/actionlint.tar.gz | grep -q "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8" || (echo "Checksum mismatch!" && exit 1)
+          tar xzf /tmp/actionlint.tar.gz -C /tmp
+
+      - name: Run actionlint on workflow files
+        run: |
+          /tmp/actionlint .github/workflows/*.yml
