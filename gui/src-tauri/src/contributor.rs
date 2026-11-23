@@ -1546,6 +1546,13 @@ pub struct SettingsView {
     pub autostart: bool,
     pub staging_mode: &'static str,
     pub public_key_configured: bool,
+    /// Operator issuance panel visibility. Hidden from volunteers (ELI5
+    /// doctrine): the section renders only when the app was launched with
+    /// LH_OPERATOR=1/-true, or the operator has already configured a key
+    /// path in settings. Functionally inert otherwise — issuing requires
+    /// the operator's private key AND Cloudflare bearer token, and every
+    /// path fails closed without them.
+    pub operator_visible: bool,
     /// Last 6 hex chars of the configured PUBLIC key (not a secret, but we
     /// still avoid echoing the whole thing into the webview).
     pub public_key_tail: String,
@@ -1783,6 +1790,12 @@ fn settings_view(st: &AppState) -> SettingsView {
         legacy
     };
     let staging_mode = AppState::staging_mode(&s);
+    let operator_env_flag = std::env::var("LH_OPERATOR")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true"
+        })
+        .unwrap_or(false);
     SettingsView {
         coordinator_url: s.coordinator_url,
         concurrency: s.concurrency,
@@ -1792,6 +1805,7 @@ fn settings_view(st: &AppState) -> SettingsView {
         autostart: s.autostart,
         staging_mode,
         public_key_configured: !stored_key.is_empty(),
+        operator_visible: operator_env_flag || !s.operator.key_path.trim().is_empty(),
         public_key_tail: if stored_key.len() >= 6 {
             stored_key[stored_key.len() - 6..].to_string()
         } else {

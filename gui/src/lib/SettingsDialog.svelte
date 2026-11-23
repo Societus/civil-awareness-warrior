@@ -1011,10 +1011,13 @@
 						</div>
 					</section>
 
-					<!-- Operator — job issuance (advanced) -->
-					<section class="settings-section" aria-labelledby="operator-title">
-						<h3 class="section-label" id="operator-title">Operator — job issuance (advanced)</h3>
-						<p class="fine">Generate and optionally insert signed chunk contracts into Cloudflare D1. Volunteers never see this panel.</p>
+					<!-- Operator — job issuance (advanced): renders only when the
+				     app is running with LH_OPERATOR=1 or a key path is
+				     already configured. Volunteers never see it at all. -->
+				{#if view?.operator_visible}
+				<section class="settings-section" aria-labelledby="operator-title">
+					<h3 class="section-label" id="operator-title">Operator — job issuance (advanced)</h3>
+					<p class="fine">Generate and optionally insert signed chunk contracts into Cloudflare D1. Volunteers never see this panel.</p>
 
 						<div>
 							<label for="op-key-path">Private key path (PKCS#8 PEM, 0600)</label>
@@ -1091,6 +1094,7 @@
 							</details>
 						{/if}
 					</section>
+					{/if}
 
 					<div class="settings-actions">
 			<button class="primary" onclick={save} disabled={busy}>Save settings</button>
