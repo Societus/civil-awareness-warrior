@@ -712,14 +712,45 @@ pub fn load_or_create(dir: &Path) -> Result<GuiSettings, String> {
                     );
                     s.local_model.llama_server_bin = String::new();
                 }
+                auto_detect_operator_key(&mut s, dir);
                 return Ok(s);
             }
             Err(e) => eprintln!("settings.json corrupt ({e}); writing defaults"),
         }
     }
-    let s = GuiSettings::defaults_from_env();
+    let mut s = GuiSettings::defaults_from_env();
+    auto_detect_operator_key(&mut s, dir);
     write(dir, &s)?;
     Ok(s)
+}
+
+/// Operator convenience, companion to the LH_OPERATOR visibility flag: if
+/// no signing-key path is configured and the app data dir (Roaming on
+/// Windows) contains exactly ONE .pem file, adopt it as the operator key
+/// path. This is what makes "drop the private PEM next to the json files"
+/// start the app in operator mode. Zero or multiple candidates stay
+/// unconfigured — an ambiguous key choice is resolved by hand, never
+/// guessed. The chosen value persists to settings.json on the next save.
+fn auto_detect_operator_key(s: &mut GuiSettings, dir: &Path) {
+    if !s.operator.key_path.trim().is_empty() {
+        return; // operator already chose a path — never override
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let pems: Vec<std::path::PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && p.extension()
+                    .map(|x| x.eq_ignore_ascii_case("pem"))
+                    .unwrap_or(false)
+        })
+        .collect();
+    if pems.len() == 1 {
+        s.operator.key_path = pems[0].display().to_string();
+    }
 }
 
 pub fn write(dir: &Path, s: &GuiSettings) -> Result<(), String> {
@@ -1545,5 +1576,53 @@ mod tests {
             with_url("http://192.168.1.20:8787").validate().unwrap_err().field,
             "coordinator_url"
         );
+    }
+
+    /// Operator key auto-detect: a single .pem dropped in the app data dir
+    /// (Roaming on Windows) is adopted as the operator key path on load;
+    /// zero or multiple candidates stay unconfigured.
+    #[test]
+    fn load_or_create_adopts_a_lone_pem_from_the_data_dir() {
+        let dir = std::env::temp_dir().join("lhc-settings-autodetect");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+
+        // Fresh dir, no pem: no key path.
+        let s = load_or_create(&dir).expect("load");
+        assert!(s.operator.key_path.is_empty());
+
+        // Drop exactly one pem (any casing) + the json files that already
+        // exist there: adopted.
+        std::fs::write(dir.join("operator-ed25519-private.PEM"), "stub").expect("pem");
+        let s = load_or_create(&dir).expect("load");
+        assert_eq!(
+            std::path::Path::new(&s.operator.key_path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .as_deref(),
+            Some("pem"),
+            "the lone pem must be adopted: got {:?}",
+            s.operator.key_path
+        );
+
+        // Two candidates = ambiguity: a fresh dir with two pems stays empty.
+        let dir2 = std::env::temp_dir().join("lhc-settings-autodetect-2");
+        let _ = std::fs::remove_dir_all(&dir2);
+        std::fs::create_dir_all(&dir2).expect("dir");
+        std::fs::write(dir2.join("a.pem"), "stub").expect("a");
+        std::fs::write(dir2.join("b.pem"), "stub").expect("b");
+        let s2 = load_or_create(&dir2).expect("load");
+        assert!(s2.operator.key_path.is_empty(), "ambiguous pems must not auto-adopt");
+
+        // An explicitly configured path is never overridden.
+        let mut configured = load_or_create(&dir).expect("load");
+        configured.operator.key_path = "/elsewhere/key.pem".to_string();
+        crate::settings::write(&dir, &configured).expect("save");
+        let reloaded = load_or_create(&dir).expect("reload");
+        assert_eq!(reloaded.operator.key_path, "/elsewhere/key.pem");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 }
