@@ -2381,7 +2381,7 @@ dependencies = [
 
 [[package]]
 name = "lh-contributor-gui"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "chrono",
  "ed25519-dalek",
