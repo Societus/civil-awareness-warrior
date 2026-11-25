@@ -1055,7 +1055,7 @@
 						<div>
 							<label for="op-cf-token">CF API bearer token (D1 permissions)</label>
 							<input id="op-cf-token" type="password" bind:value={draft.operator_cf_token} placeholder={view?.operator_cf_token_present ? 'stored — type to replace, or press Remove token' : 'only ever sent to the D1 REST endpoint'} autocomplete="off" />
-							<button onclick={testCfToken} disabled={busy || !draft.operator.cf_token.trim() || !draft.operator.cf_account_id.trim() || !draft.operator.cf_database_id.trim()}>{pendingLabel === 'Test CF token' ? 'Testing…' : 'Test token'}</button>
+							<button onclick={testCfToken} disabled={busy || !draft.operator_cf_token.trim() || !draft.operator.cf_account_id.trim() || !draft.operator.cf_database_id.trim()}>{pendingLabel === 'Test CF token' ? 'Testing…' : 'Test token'}</button>
 							{#if cfTokenResult}
 								<p class="fine action-result {cfTokenResult.ok ? 'result-ok' : 'result-err'}">{cfTokenResult.text}</p>
 							{/if}
