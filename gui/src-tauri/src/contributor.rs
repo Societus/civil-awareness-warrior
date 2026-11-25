@@ -1924,6 +1924,63 @@ pub async fn start_contributor(app: AppHandle) -> Result<(), String> {
     begin_run(app.state::<Arc<AppState>>().inner()).await
 }
 
+/// Operator issuance, step 0: verify a Cloudflare API bearer token against
+/// the token-verify endpoint. Draft-probe rule applies: the DRAFT token
+/// (typed but unsaved) is tested when present, otherwise the STORED token
+/// from operator_cf_token.json. No mutation, and the token itself never
+/// appears in any error text.
+#[tauri::command]
+pub async fn cf_token_verify(
+    app: AppHandle,
+    bearer: Option<String>,
+) -> Result<String, String> {
+    let draft = bearer.map(|b| b.trim().to_string()).filter(|b| !b.is_empty());
+    let token = match draft {
+        Some(t) => t,
+        None => {
+            let st = app.state::<Arc<AppState>>();
+            settings::read_operator_cf_token(&st.data_dir)
+                .filter(|t| !t.trim().is_empty())
+                .ok_or_else(|| {
+                    "no token to test — paste one (or save one) first".to_string()
+                })?
+        }
+    };
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("HTTP client: {e}"))?;
+    let url = reqwest::Url::parse("https://api.cloudflare.com/client/v4/user/tokens/verify")
+        .map_err(|e| format!("verify URL: {e}"))?;
+    if url.scheme() != "https" {
+        return Err("verify endpoint must be https — refusing to send the token in cleartext".to_string());
+    }
+    let resp = client
+        .get(url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .map_err(|e| format!("verify request failed: {e}"))?;
+    let v: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("verify response: {e}"))?;
+    if v.get("success").and_then(|x| x.as_bool()) == Some(true) {
+        let status = v
+            .get("result")
+            .and_then(|r| r.get("status"))
+            .and_then(|s| s.as_str())
+            .unwrap_or("active");
+        Ok(format!("Cloudflare says the token is valid ({status})"))
+    } else {
+        let msg = v
+            .get("errors")
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "unknown error".to_string());
+        Err(format!("Cloudflare rejected the token: {msg}"))
+    }
+}
+
 /// Operator issuance, step 1 of the seeding flow: load the private key at
 /// `key_path` and return ONLY its public half (64-hex), for the operator to
 /// eyeball against the Worker's PUBLIC_KEY_HEX secret and the app pin.
@@ -2022,6 +2079,7 @@ pub async fn operator_seed(
     input: OperatorSeedInput,
 ) -> Result<OperatorSeedOutput, String> {
     let st = app.state::<Arc<AppState>>();
+    eprintln!("[operator_seed] entered (dry_run={})", input.dry_run);
     let settings = st.settings_snapshot();
 
     // Read operator settings (key_path, cf_account_id, cf_database_id)
@@ -2186,6 +2244,7 @@ pub async fn operator_seed(
     });
 
     if input.dry_run {
+        eprintln!("[operator_seed] exiting dry-run ok");
         return Ok(OperatorSeedOutput {
             manifest,
             dry_run: true,
@@ -2921,6 +2980,7 @@ pub fn save_settings(
     input: SettingsInput,
 ) -> Result<SettingsView, FieldError> {
     let st = app.state::<Arc<AppState>>();
+    eprintln!("[save_settings] entered");
     let prev = st.settings_snapshot();
     let s = {
         let merged = merge_settings(&prev, &input);

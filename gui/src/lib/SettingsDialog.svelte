@@ -274,7 +274,7 @@
 		derivedPubKey = '';
 		errors = {};
 		try {
-			const r = await invoke('operator_key_info', { key_path: draft.operator.key_path.trim() });
+			const r = await invoke('operator_key_info', { keyPath: draft.operator.key_path.trim() });
 			derivedPubKey = r.public_key_hex;
 			note = `Derived public key: ${r.public_key_hex}`;
 		} catch (e) {
@@ -290,29 +290,22 @@
 			note = 'CF token test is only available in the real app — demo mode has no network side.';
 			return;
 		}
-		// The operator_seed command reads operator settings from the stored settings.
-		// Ensure they are saved first (the Save button does this).
-		if (!view?.operator?.key_path?.trim() || !view?.operator?.cf_account_id?.trim() || !view?.operator?.cf_database_id?.trim()) {
-			cfTokenResult = { ok: false, text: 'Operator settings not saved — press Save settings first, then test' };
-			return;
-		}
-		if (!draft.operator_cf_token.trim()) {
-			cfTokenResult = { ok: false, text: 'Enter a CF token to test' };
-			return;
-		}
+		// Draft-probe parity: test the typed draft when present, else the
+		// STORED token (the Rust side reads operator_cf_token.json when the
+		// bearer arg is omitted). Cloudflare's token-verify endpoint answers
+		// whether the token is real and active — no D1 touched, no mutation,
+		// and the token never appears in any error text.
 		busy = true;
 		pendingLabel = 'Test CF token';
 		note = '';
 		errors = {};
 		cfTokenResult = null;
 		try {
-			// Use a minimal targets CSV for dry-run test
-			const r = await invoke('operator_seed', {
-				targets_csv_path: '/dev/null',
-				dry_run: true
+			const r = await invoke('cf_token_verify', {
+				bearer: draft.operator_cf_token.trim() === '' ? undefined : draft.operator_cf_token.trim()
 			});
-			cfTokenResult = { ok: true, text: 'CF token accepted by D1 endpoint (dry run ok)' };
-			note = 'CF token test passed — D1 endpoint accepted the credentials';
+			cfTokenResult = { ok: true, text: String(r) };
+			note = 'Token verified. Remember to Save settings so Issue chunks uses it.';
 		} catch (e) {
 			cfTokenResult = { ok: false, text: String(e) };
 			errors = toFieldErrors(e);
@@ -338,16 +331,29 @@
 		operatorSeedResult = null;
 		operatorSeedManifest = null;
 		try {
+			// The Rust side reads the key path, CF ids, and token from the
+			// SAVED settings snapshot — persist the current draft first so
+			// Issue chunks always operates on exactly what the panel shows.
+			await save();
+			if (Object.keys(errors).length > 0) {
+				operatorSeedResult = { ok: false, text: 'Save failed — fix the highlighted fields, then press Issue chunks again' };
+				return;
+			}
+			// operator_seed takes one struct arg; its fields are serde
+			// snake_case (the camelCase conversion applies only to the
+			// command's own top-level args).
 			const r = await invoke('operator_seed', {
-				targets_csv_path: draft.operator_targets_csv.trim(),
-				canary_answers_path: draft.operator_canary_answers_csv.trim() || undefined,
-				dry_run: draft.operator_dry_run,
-				expires_days: 30,
-				schema_version: 1,
-				priority: 0,
-				expected_duration_sec: 3600,
-				lease_ttl_sec: 7200,
-				staging_upload_prefix: ''
+				input: {
+					targets_csv_path: draft.operator_targets_csv.trim(),
+					canary_answers_path: draft.operator_canary_answers_csv.trim() || undefined,
+					dry_run: draft.operator_dry_run,
+					expires_days: 30,
+					schema_version: 1,
+					priority: 0,
+					expected_duration_sec: 3600,
+					lease_ttl_sec: 7200,
+					staging_upload_prefix: ''
+				}
 			});
 			operatorSeedResult = { ok: true, text: r.dry_run ? `Dry run: ${r.chunks_count} chunks, ${r.canaries_count} canaries` : `Inserted ${r.chunks_count} chunks, ${r.canaries_count} canaries into D1` };
 			operatorSeedManifest = { manifest: r.manifest, chunks_count: r.chunks_count, canaries_count: r.canaries_count };
@@ -1055,7 +1061,7 @@
 						<div>
 							<label for="op-cf-token">CF API bearer token (D1 permissions)</label>
 							<input id="op-cf-token" type="password" bind:value={draft.operator_cf_token} placeholder={view?.operator_cf_token_present ? 'stored — type to replace, or press Remove token' : 'only ever sent to the D1 REST endpoint'} autocomplete="off" />
-							<button onclick={testCfToken} disabled={busy || !draft.operator_cf_token.trim() || !draft.operator.cf_account_id.trim() || !draft.operator.cf_database_id.trim()}>{pendingLabel === 'Test CF token' ? 'Testing…' : 'Test token'}</button>
+							<button onclick={testCfToken} disabled={busy || (!draft.operator_cf_token.trim() && !view?.operator_cf_token_present)}>{pendingLabel === 'Test CF token' ? 'Testing…' : 'Test token'}</button>
 							{#if cfTokenResult}
 								<p class="fine action-result {cfTokenResult.ok ? 'result-ok' : 'result-err'}">{cfTokenResult.text}</p>
 							{/if}
