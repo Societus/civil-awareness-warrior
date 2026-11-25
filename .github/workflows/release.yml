@@ -280,8 +280,11 @@ jobs:
         run: |
           find . -mindepth 2 -type f -exec mv {} . \;
           find . -mindepth 1 -type d -empty -delete
+          # stage through a temp file: writing the output while find still
+          # traverses the directory is the SC2094 read/write-same-file race
           find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 | sort -z \
-            | xargs -0 sha256sum > SHA256SUMS
+            | xargs -0 sha256sum > SHA256SUMS.part
+          mv SHA256SUMS.part SHA256SUMS
 
       - name: Publish the GitHub Release
         uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4 (node 24)
