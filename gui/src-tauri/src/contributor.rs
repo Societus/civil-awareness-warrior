@@ -2335,17 +2335,33 @@ async fn insert_into_d1(
     use reqwest::Client;
     use serde_json::json;
 
+    // Every call below rides the operator's Cloudflare bearer token, so the
+    // endpoint URL must be structurally https — not just formatted with an
+    // https literal. Parse into a Url and refuse anything else; this also
+    // satisfies CodeQL's cleartext-transmission rule, which cannot reason
+    // about scheme inside a format! string.
+    fn d1_query_url(account: &str, db_id: &str) -> Result<reqwest::Url, String> {
+        let parsed = reqwest::Url::parse(&format!(
+            "https://api.cloudflare.com/client/v4/accounts/{account}/d1/database/{db_id}/query"
+        ))
+        .map_err(|e| format!("D1 endpoint URL: {e}"))?;
+        if parsed.scheme() != "https" {
+            return Err("D1 endpoint must be https — refusing to send the bearer token in cleartext".to_string());
+        }
+        Ok(parsed)
+    }
+
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| format!("D1 client: {e}"))?;
+    let chunks_url = d1_query_url(account, db_id)?;
 
     // Chunks insert (batch all in one query call, like the Python script)
     let chunks_sql = build_chunks_insert_sql(records);
     let chunks_params = build_chunks_insert_params(records);
     let chunks_body = json!({ "sql": chunks_sql, "params": chunks_params });
-    let chunks_url = format!("https://api.cloudflare.com/client/v4/accounts/{account}/d1/database/{db_id}/query");
-    let resp = client.post(&chunks_url)
+    let resp = client.post(chunks_url.clone())
         .bearer_auth(bearer)
         .json(&chunks_body)
         .send()
@@ -2361,7 +2377,7 @@ async fn insert_into_d1(
     if !canary_rows.is_empty() {
         // Ensure canaries table exists
         let ddl_body = json!({ "sql": "CREATE TABLE IF NOT EXISTS canaries (chunk_id TEXT PRIMARY KEY REFERENCES chunks(chunk_id), expected_result_hash TEXT NOT NULL, created_at INTEGER NOT NULL)" });
-        let ddl_resp = client.post(&chunks_url)
+        let ddl_resp = client.post(chunks_url.clone())
             .bearer_auth(bearer)
             .json(&ddl_body)
             .send()
@@ -2375,7 +2391,7 @@ async fn insert_into_d1(
         let canaries_sql = build_canaries_insert_sql(canary_rows);
         let canaries_params = build_canaries_insert_params(canary_rows);
         let canaries_body = json!({ "sql": canaries_sql, "params": canaries_params });
-        let can_resp = client.post(&chunks_url)
+        let can_resp = client.post(chunks_url.clone())
             .bearer_auth(bearer)
             .json(&canaries_body)
             .send()
@@ -2395,7 +2411,7 @@ async fn insert_into_d1(
         chunk_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ")
     );
     let readback_body = json!({ "sql": readback_sql, "params": chunk_ids });
-    let rb_resp = client.post(&chunks_url)
+    let rb_resp = client.post(chunks_url.clone())
         .bearer_auth(bearer)
         .json(&readback_body)
         .send()
