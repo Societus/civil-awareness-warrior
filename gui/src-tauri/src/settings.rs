@@ -236,20 +236,7 @@ impl ResourceCap {
     }
 }
 
-/// Operator issuance settings. The private key PATH is stored (key bytes
-/// never leave the operator's disk — read fresh per operation). The CF
-/// bearer token lives in its own 0600 `operator_cf_token.json` (same
-/// protection class as credentials.json / llm_api_key.json) and is only
-/// ever sent to the D1 REST endpoint.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-pub struct OperatorCfg {
-    #[serde(default)]
-    pub key_path: String,
-    #[serde(default)]
-    pub cf_account_id: String,
-    #[serde(default)]
-    pub cf_database_id: String,
-}
+
 
 /// The persisted Local Model settings. The API key is deliberately NOT a
 /// field: it lives in its own 0600 `llm_api_key.json` (same protection
@@ -370,8 +357,6 @@ pub struct GuiSettings {
     pub schedule: ScheduleCfg,
     #[serde(default)]
     pub local_model: LocalModelCfg,
-    #[serde(default)]
-    pub operator: OperatorCfg,
     /// Launch-at-login INTENT (Settings checkbox → apply_autostart in
     /// contributor.rs). The OS entry the autostart plugin writes: an HKCU
     /// `Software\Microsoft\Windows\CurrentVersion\Run` value on Windows, a
@@ -452,7 +437,6 @@ impl GuiSettings {
             capabilities,
             schedule: ScheduleCfg::default(),
             local_model,
-            operator: OperatorCfg::default(),
             // Launch-at-login is deliberately NOT env-seedable: registering
             // a per-user OS login entry is a human action (the Settings
             // checkbox), same doctrine as Auto model mode being UI-only.
@@ -712,46 +696,16 @@ pub fn load_or_create(dir: &Path) -> Result<GuiSettings, String> {
                     );
                     s.local_model.llama_server_bin = String::new();
                 }
-                auto_detect_operator_key(&mut s, dir);
                 return Ok(s);
             }
             Err(e) => eprintln!("settings.json corrupt ({e}); writing defaults"),
         }
     }
-    let mut s = GuiSettings::defaults_from_env();
-    auto_detect_operator_key(&mut s, dir);
+    let s = GuiSettings::defaults_from_env();
     write(dir, &s)?;
     Ok(s)
 }
 
-/// Operator convenience, companion to the LH_OPERATOR visibility flag: if
-/// no signing-key path is configured and the app data dir (Roaming on
-/// Windows) contains exactly ONE .pem file, adopt it as the operator key
-/// path. This is what makes "drop the private PEM next to the json files"
-/// start the app in operator mode. Zero or multiple candidates stay
-/// unconfigured — an ambiguous key choice is resolved by hand, never
-/// guessed. The chosen value persists to settings.json on the next save.
-fn auto_detect_operator_key(s: &mut GuiSettings, dir: &Path) {
-    if !s.operator.key_path.trim().is_empty() {
-        return; // operator already chose a path — never override
-    }
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    let pems: Vec<std::path::PathBuf> = entries
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            p.is_file()
-                && p.extension()
-                    .map(|x| x.eq_ignore_ascii_case("pem"))
-                    .unwrap_or(false)
-        })
-        .collect();
-    if pems.len() == 1 {
-        s.operator.key_path = pems[0].display().to_string();
-    }
-}
 
 pub fn write(dir: &Path, s: &GuiSettings) -> Result<(), String> {
     fs::create_dir_all(dir).map_err(|e| format!("could not create app data dir: {e}"))?;
@@ -815,50 +769,6 @@ pub fn write_llm_key(dir: &Path, key: Option<&str>) -> Result<(), String> {
     }
 }
 
-/// Operator CF API bearer token (issuance) — separate 0600 credential file
-/// with the same protection class as credentials.json / llm_api_key.json.
-/// Never echoed into any settings view, never logged, and only ever sent
-/// to the Cloudflare D1 REST endpoint as a Bearer token.
-pub fn operator_cf_token_path(dir: &Path) -> std::path::PathBuf {
-    dir.join("operator_cf_token.json")
-}
-
-pub fn read_operator_cf_token(dir: &Path) -> Option<String> {
-    #[derive(serde::Deserialize)]
-    struct KeyFile {
-        bearer_token: String,
-    }
-    fs::read_to_string(operator_cf_token_path(dir))
-        .ok()
-        .and_then(|t| serde_json::from_str::<KeyFile>(&t).ok())
-        .map(|k| k.bearer_token)
-        .filter(|k| !k.is_empty())
-}
-
-/// Some(non-empty) stores; Some("") removes; None is a no-op.
-pub fn write_operator_cf_token(dir: &Path, key: Option<&str>) -> Result<(), String> {
-    let path = operator_cf_token_path(dir);
-    match key.map(str::trim) {
-        None => Ok(()),
-        Some("") => {
-            if path.exists() {
-                fs::remove_file(&path).map_err(|e| format!("could not remove operator CF token file: {e}"))?;
-            }
-            Ok(())
-        }
-        Some(k) => {
-            fs::create_dir_all(dir).map_err(|e| format!("could not create app data dir: {e}"))?;
-            let json = serde_json::json!({ "bearer_token": k }).to_string();
-            fs::write(&path, json).map_err(|e| format!("could not write {}: {e}", path.display()))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
-            }
-            Ok(())
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Cross-session runtime total (runtime.json)
@@ -942,7 +852,7 @@ mod tests {
                 model_name: "qwen3:8b".to_string(),
                 ctx_tokens: 8192,
             },
-            operator: OperatorCfg::default(),
+
             // true on purpose: the roundtrip must prove the intent survives
             // write → load, not just the off default.
             autostart: true,
@@ -1093,7 +1003,7 @@ mod tests {
             capabilities: Capabilities::default(),
             schedule: ScheduleCfg::default(),
             local_model: LocalModelCfg::default(),
-            operator: OperatorCfg::default(),
+
             autostart: false,
         };
         assert!(base.clone().validate().is_ok());
@@ -1203,7 +1113,7 @@ mod tests {
             capabilities: Capabilities::default(),
             schedule: ScheduleCfg::default(),
             local_model: LocalModelCfg::default(),
-            operator: OperatorCfg::default(),
+
             autostart: false,
         };
 
@@ -1489,7 +1399,7 @@ mod tests {
             capabilities: Capabilities::default(),
             schedule: ScheduleCfg::default(),
             local_model: LocalModelCfg::default(),
-            operator: OperatorCfg::default(),
+
             autostart: false,
         };
 
@@ -1551,7 +1461,7 @@ mod tests {
             capabilities: Capabilities::default(),
             schedule: ScheduleCfg::default(),
             local_model: LocalModelCfg::default(),
-            operator: OperatorCfg::default(),
+
             autostart: false,
         };
         let with_url = |url: &str| GuiSettings {
@@ -1578,51 +1488,23 @@ mod tests {
         );
     }
 
-    /// Operator key auto-detect: a single .pem dropped in the app data dir
-    /// (Roaming on Windows) is adopted as the operator key path on load;
-    /// zero or multiple candidates stay unconfigured.
+    /// Unknown keys in an existing settings.json (for example operator
+    /// fields written by a newer build) must be ignored gracefully on
+    /// load — no migration error, unknown fields simply dropped.
     #[test]
-    fn load_or_create_adopts_a_lone_pem_from_the_data_dir() {
-        let dir = std::env::temp_dir().join("lhc-settings-autodetect");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("dir");
-
-        // Fresh dir, no pem: no key path.
+    fn unknown_settings_json_keys_are_ignored_on_load() {
+        let dir = std::env::temp_dir().join("lhc-settings-unknown-keys");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        fs::write(
+            settings_path(&dir),
+            r#"{"coordinator_url":"https://example.test","public_key_hex":"","concurrency":3,"dry_run":false,"operator":{"key_path":"/x/operator.pem","cf_account_id":"acct","cf_database_id":"db","cf_bearer_token":"***"},"bogus_custom_key":true}"#,
+        )
+        .expect("seed");
         let s = load_or_create(&dir).expect("load");
-        assert!(s.operator.key_path.is_empty());
-
-        // Drop exactly one pem (any casing) + the json files that already
-        // exist there: adopted.
-        std::fs::write(dir.join("operator-ed25519-private.PEM"), "stub").expect("pem");
-        let s = load_or_create(&dir).expect("load");
-        assert_eq!(
-            std::path::Path::new(&s.operator.key_path)
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.to_ascii_lowercase())
-                .as_deref(),
-            Some("pem"),
-            "the lone pem must be adopted: got {:?}",
-            s.operator.key_path
-        );
-
-        // Two candidates = ambiguity: a fresh dir with two pems stays empty.
-        let dir2 = std::env::temp_dir().join("lhc-settings-autodetect-2");
-        let _ = std::fs::remove_dir_all(&dir2);
-        std::fs::create_dir_all(&dir2).expect("dir");
-        std::fs::write(dir2.join("a.pem"), "stub").expect("a");
-        std::fs::write(dir2.join("b.pem"), "stub").expect("b");
-        let s2 = load_or_create(&dir2).expect("load");
-        assert!(s2.operator.key_path.is_empty(), "ambiguous pems must not auto-adopt");
-
-        // An explicitly configured path is never overridden.
-        let mut configured = load_or_create(&dir).expect("load");
-        configured.operator.key_path = "/elsewhere/key.pem".to_string();
-        crate::settings::write(&dir, &configured).expect("save");
-        let reloaded = load_or_create(&dir).expect("reload");
-        assert_eq!(reloaded.operator.key_path, "/elsewhere/key.pem");
-
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&dir2);
+        assert_eq!(s.coordinator_url, "https://example.test");
+        assert_eq!(s.concurrency, 3);
+        assert!(s.validate().is_ok(), "loaded settings with unknown keys still validate");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

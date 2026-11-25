@@ -31,7 +31,6 @@
 	function seedDraft(v) {
 		const c = v?.capabilities ?? {};
 		const sc = v?.schedule ?? {};
-		const op = v?.operator ?? {};
 		return {
 			coordinator_url: v?.coordinator_url ?? '',
 			public_key_hex: '',
@@ -61,15 +60,6 @@
 				model_name: v?.local_model?.model_name ?? '',
 				ctx_tokens: v?.local_model?.ctx_tokens ?? 4096
 			},
-			operator: {
-				key_path: op.key_path ?? '',
-				cf_account_id: op.cf_account_id ?? '',
-				cf_database_id: op.cf_database_id ?? ''
-			},
-			operator_cf_token: '',
-			operator_dry_run: true,
-			operator_targets_csv: '',
-			operator_canary_answers_csv: '',
 			// API keys never round-trip through any settings view; this field is
 			// for ENTERING a new key only (the backend stores it out-of-band in
 			// llm_api_key.json and never echoes it back).
@@ -96,12 +86,6 @@
 	let nowMs = $state(Date.now());
 
 	// Operator panel state
-	let derivedPubKey = $state('');
-	let derivingPubKey = $state(false);
-	let derivePubError = $state('');
-	let cfTokenResult = $state(/** @type {{ok: boolean, text: string} | null} */ (null));
-	let operatorSeedResult = $state(/** @type {{ok: boolean, text: string} | null} */ (null));
-	let operatorSeedManifest = $state(/** @type {{manifest: any, chunks_count: number, canaries_count: number} | null} */ (null));
 
 	/** @type {HTMLDivElement | null} */
 	let panel = $state(null);
@@ -159,13 +143,10 @@
 			},
 			autostart: draft.autostart,
 			local_model: { ...draft.local_model },
-			operator: { ...draft.operator },
 			// Key handling: sent ONLY when a new key was typed (replace) or
 			// Remove key was pressed ('' → backend deletes the stored file).
 			// Untouched saves omit it entirely.
 			llm_api_key: removeLlmKey ? '' : draft.llm_api_key.trim() === '' ? undefined : draft.llm_api_key.trim(),
-			// Operator CF bearer token: same pattern as llm_api_key
-			operator_cf_token: draft.operator_cf_token.trim() === '' ? undefined : draft.operator_cf_token.trim()
 		};
 		try {
 			const next = inTauri ? await invoke('save_settings', { input }) : demoSaveSettings(input);
@@ -179,7 +160,6 @@
 				schedule: { ...next.schedule },
 				autostart: next.autostart,
 				local_model: { ...next.local_model },
-				operator: { ...next.operator },
 				llm_api_key: ''
 			};
 			removeLlmKey = false;
@@ -253,113 +233,6 @@
 			await onChanged?.();
 		} catch (e) {
 			coordResult = { ok: false, text: String(e) };
-			errors = toFieldErrors(e);
-		} finally {
-			pendingLabel = '';
-			busy = false;
-		}
-	}
-
-	async function derivePubKey() {
-		if (!inTauri) {
-			note = 'Key derivation is only available in the real app — demo mode has no key access.';
-			return;
-		}
-		if (!draft.operator.key_path.trim()) {
-			derivePubError = 'Key path is empty';
-			return;
-		}
-		derivingPubKey = true;
-		derivePubError = '';
-		derivedPubKey = '';
-		errors = {};
-		try {
-			const r = await invoke('operator_key_info', { keyPath: draft.operator.key_path.trim() });
-			derivedPubKey = r.public_key_hex;
-			note = `Derived public key: ${r.public_key_hex}`;
-		} catch (e) {
-			derivePubError = String(e);
-			errors = toFieldErrors(e);
-		} finally {
-			derivingPubKey = false;
-		}
-	}
-
-	async function testCfToken() {
-		if (!inTauri) {
-			note = 'CF token test is only available in the real app — demo mode has no network side.';
-			return;
-		}
-		// Draft-probe parity: test the typed draft when present, else the
-		// STORED token (the Rust side reads operator_cf_token.json when the
-		// bearer arg is omitted). Cloudflare's token-verify endpoint answers
-		// whether the token is real and active — no D1 touched, no mutation,
-		// and the token never appears in any error text.
-		busy = true;
-		pendingLabel = 'Test CF token';
-		note = '';
-		errors = {};
-		cfTokenResult = null;
-		try {
-			const r = await invoke('cf_token_verify', {
-				bearer: draft.operator_cf_token.trim() === '' ? undefined : draft.operator_cf_token.trim()
-			});
-			cfTokenResult = { ok: true, text: String(r) };
-			note = 'Token verified. Remember to Save settings so Issue chunks uses it.';
-		} catch (e) {
-			cfTokenResult = { ok: false, text: String(e) };
-			errors = toFieldErrors(e);
-		} finally {
-			pendingLabel = '';
-			busy = false;
-		}
-	}
-
-	async function runOperatorSeed() {
-		if (!inTauri) {
-			note = 'Operator seed is only available in the real app — demo mode has no key/network access.';
-			return;
-		}
-		if (!draft.operator.key_path.trim() || !draft.operator.cf_account_id.trim() || !draft.operator.cf_database_id.trim() || !draft.operator_targets_csv.trim()) {
-			operatorSeedResult = { ok: false, text: 'Key path, Account ID, Database ID, and Targets CSV are required' };
-			return;
-		}
-		busy = true;
-		pendingLabel = 'Issue chunks';
-		note = '';
-		errors = {};
-		operatorSeedResult = null;
-		operatorSeedManifest = null;
-		try {
-			// The Rust side reads the key path, CF ids, and token from the
-			// SAVED settings snapshot — persist the current draft first so
-			// Issue chunks always operates on exactly what the panel shows.
-			await save();
-			if (Object.keys(errors).length > 0) {
-				operatorSeedResult = { ok: false, text: 'Save failed — fix the highlighted fields, then press Issue chunks again' };
-				return;
-			}
-			// operator_seed takes one struct arg; its fields are serde
-			// snake_case (the camelCase conversion applies only to the
-			// command's own top-level args).
-			const r = await invoke('operator_seed', {
-				input: {
-					targets_csv_path: draft.operator_targets_csv.trim(),
-					canary_answers_path: draft.operator_canary_answers_csv.trim() || undefined,
-					dry_run: draft.operator_dry_run,
-					expires_days: 30,
-					schema_version: 1,
-					priority: 0,
-					expected_duration_sec: 3600,
-					lease_ttl_sec: 7200,
-					staging_upload_prefix: ''
-				}
-			});
-			operatorSeedResult = { ok: true, text: r.dry_run ? `Dry run: ${r.chunks_count} chunks, ${r.canaries_count} canaries` : `Inserted ${r.chunks_count} chunks, ${r.canaries_count} canaries into D1` };
-			operatorSeedManifest = { manifest: r.manifest, chunks_count: r.chunks_count, canaries_count: r.canaries_count };
-			note = r.dry_run ? `Dry run complete — ${r.chunks_count} chunks, ${r.canaries_count} canaries` : `Live insert complete — ${r.chunks_count} chunks, ${r.canaries_count} canaries inserted`;
-		} catch (e) {
-			operatorSeedResult = { ok: false, text: String(e) };
 			errors = toFieldErrors(e);
 		} finally {
 			pendingLabel = '';
@@ -722,7 +595,7 @@
 					<b>{view?.data_dir ?? '—'}</b>
 				</div>
 			</div>
-			<div class="settings-actions">
+				<div class="settings-actions">
 				<button onclick={register} disabled={busy || loopActive}>Register</button>
 				<button class={armedUnregister ? 'danger armed' : 'danger'} onclick={unregister} disabled={busy || !view?.credentials_present}>
 					{armedUnregister ? 'Confirm unregister?' : 'Unregister'}
@@ -832,7 +705,7 @@
 						{#if llm?.detail}
 						<p class="fine lm-detail">{llm.detail}</p>
 						{/if}
-						<div class="settings-actions">
+				<div class="settings-actions">
 						<button onclick={() => lmAction('download_local_model', 'Model download')} disabled={busy}>{pendingLabel === 'Model download' ? 'Downloading…' : 'Download model'}</button>
 						<button onclick={() => lmAction('check_local_model', 'Endpoint check')} disabled={busy}>{pendingLabel === 'Endpoint check' ? 'Checking…' : 'Check now'}</button>
 						{#if lmResult}
@@ -840,7 +713,7 @@
 						{/if}
 						<button class="danger" onclick={() => lmAction('delete_local_model', 'Free disk')} disabled={busy}>Free disk</button>
 						</div>
-						<div class="settings-actions">
+				<div class="settings-actions">
 						<button onclick={checkBinaryUpdates} disabled={busy}>Check for binary updates</button>
 						{#if binaryUpdate?.update_available}
 							<button onclick={installBinaryUpdate} disabled={busy}>Install llama.cpp {binaryUpdate.latest_tag}</button>
@@ -1007,7 +880,7 @@
 							</p>
 						{/each}
 						{#if hwAdvice.offer_custom_endpoint}
-							<div class="settings-actions">
+				<div class="settings-actions">
 								<button onclick={openCustomEndpoint} disabled={busy}>Open Custom endpoint settings</button>
 							</div>
 							<p class="fine">This button only preselects the Custom endpoint form above — nothing is saved until you press Save settings.</p>
@@ -1017,92 +890,7 @@
 						</div>
 					</section>
 
-					<!-- Operator — job issuance (advanced): renders only when the
-				     app is running with LH_OPERATOR=1 or a key path is
-				     already configured. Volunteers never see it at all. -->
-				{#if view?.operator_visible}
-				<section class="settings-section" aria-labelledby="operator-title">
-					<h3 class="section-label" id="operator-title">Operator — job issuance (advanced)</h3>
-					<p class="fine">Generate and optionally insert signed chunk contracts into Cloudflare D1. Volunteers never see this panel.</p>
-
-						<div>
-							<label for="op-key-path">Private key path (PKCS#8 PEM, 0600)</label>
-							<input id="op-key-path" type="text" bind:value={draft.operator.key_path} placeholder="/path/to/operator-ed25519-private.pem" autocomplete="off" />
-							{#if draft.operator.key_path.trim()}
-								<button class="danger" onclick={derivePubKey} disabled={busy || derivingPubKey}>{derivingPubKey ? 'Deriving…' : 'Derive public key'}</button>
-								{#if derivedPubKey}
-									<p class="fine action-result result-ok">Public key (ed25519): <code>{derivedPubKey}</code></p>
-								{/if}
-								{#if derivePubError}
-									<p class="fine action-result result-err">{derivePubError}</p>
-								{/if}
-							{/if}
-							{#if errors.operator_key_path}
-								<p class="field-error" role="alert">{errors.operator_key_path}</p>
-							{/if}
-						</div>
-
-						<div>
-							<label for="op-cf-account">Cloudflare account ID</label>
-							<input id="op-cf-account" type="text" bind:value={draft.operator.cf_account_id} placeholder="c2185e648de6c9d04ff0a04d918e3be4" autocomplete="off" />
-							{#if errors.operator_cf_account_id}
-								<p class="field-error" role="alert">{errors.operator_cf_account_id}</p>
-							{/if}
-						</div>
-
-						<div>
-							<label for="op-cf-db">D1 database ID</label>
-							<input id="op-cf-db" type="text" bind:value={draft.operator.cf_database_id} placeholder="59ddbd8d-c07d-436d-b71a-00aa213bb562" autocomplete="off" />
-							{#if errors.operator_cf_database_id}
-								<p class="field-error" role="alert">{errors.operator_cf_database_id}</p>
-							{/if}
-						</div>
-
-						<div>
-							<label for="op-cf-token">CF API bearer token (D1 permissions)</label>
-							<input id="op-cf-token" type="password" bind:value={draft.operator_cf_token} placeholder={view?.operator_cf_token_present ? 'stored — type to replace, or press Remove token' : 'only ever sent to the D1 REST endpoint'} autocomplete="off" />
-							<button onclick={testCfToken} disabled={busy || (!draft.operator_cf_token.trim() && !view?.operator_cf_token_present)}>{pendingLabel === 'Test CF token' ? 'Testing…' : 'Test token'}</button>
-							{#if cfTokenResult}
-								<p class="fine action-result {cfTokenResult.ok ? 'result-ok' : 'result-err'}">{cfTokenResult.text}</p>
-							{/if}
-							{#if errors.operator_cf_token}
-								<p class="field-error" role="alert">{errors.operator_cf_token}</p>
-							{/if}
-							<p class="fine">The token lives in its own 0600 file — never displayed, never logged, only sent to the D1 REST endpoint.</p>
-						</div>
-
-						<div class="toggle-row">
-							<label for="op-dryrun">Dry run (return manifest, do not insert)</label>
-							<input id="op-dryrun" type="checkbox" bind:checked={draft.operator_dry_run} />
-						</div>
-
-						<div>
-							<label for="op-targets">Targets CSV path</label>
-							<input id="op-targets" type="text" bind:value={draft.operator_targets_csv} placeholder="/path/to/targets.csv (type,target_key[,priority,expected_duration_sec,lease_ttl_sec,staging_upload_prefix])" autocomplete="off" />
-							{#if errors.operator_targets_csv}
-								<p class="field-error" role="alert">{errors.operator_targets_csv}</p>
-							{/if}
-						</div>
-
-						<div>
-							<label for="op-canary">Canary answers CSV path (optional)</label>
-							<input id="op-canary" type="text" bind:value={draft.operator_canary_answers_csv} placeholder="/path/to/canary-answers.csv (target_key,expected_result_hash)" autocomplete="off" />
-						</div>
-
-						<button onclick={runOperatorSeed} disabled={busy || !draft.operator.key_path.trim() || !draft.operator.cf_account_id.trim() || !draft.operator.cf_database_id.trim() || !draft.operator_targets_csv.trim()}>{pendingLabel === 'Issue chunks' ? 'Issuing…' : 'Issue chunks'}</button>
-						{#if operatorSeedResult}
-							<p class="fine action-result {operatorSeedResult.ok ? 'result-ok' : 'result-err'}">{operatorSeedResult.text}</p>
-						{/if}
-						{#if operatorSeedManifest && operatorSeedResult?.ok}
-							<details>
-								<summary>Manifest ({operatorSeedManifest.chunks_count} chunks, {operatorSeedManifest.canaries_count} canaries)</summary>
-								<pre class="fine" style="white-space: pre-wrap; overflow-x: auto; max-height: 200px; overflow-y: auto;">{JSON.stringify(operatorSeedManifest.manifest, null, 2)}</pre>
-							</details>
-						{/if}
-					</section>
-					{/if}
-
-					<div class="settings-actions">
+				<div class="settings-actions">
 			<button class="primary" onclick={save} disabled={busy}>Save settings</button>
 			<button onclick={() => onClose?.()} disabled={busy}>Close</button>
 		</div>

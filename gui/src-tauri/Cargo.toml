@@ -29,8 +29,6 @@ url = "2"
 sha2 = "0.10"
 futures-util = "0.3"
 libc = "0.2"
-# Operator issuance: uuid for chunk ID generation
-uuid = { version = "1", features = ["v4", "serde"] }
 # "Can I AI?" advisor links (t_10daf382): the hardware report carries the
 # operator-designated HF repo link; the opener plugin launches it in the
 # SYSTEM browser, and capabilities/default.json scopes that permission to
@@ -53,6 +51,3 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 windows = { version = "0.62", features = ["Win32_Graphics_Dxgi", "Win32_System_SystemInformation"] }
 
 [dev-dependencies]
-# operator issuance tests: deterministic key + PKCS#8 PEM roundtrip
-ed25519-dalek = { version = "2", features = ["pkcs8"] }
-pem = "3"
